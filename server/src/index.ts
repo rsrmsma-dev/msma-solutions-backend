@@ -193,6 +193,7 @@ app.register(async (r) => {
   r.post<{ Body: any }>("/api/me/certificates", (req) => records.requestCertificate(req.session!, req.body));
   r.delete<{ Params: { id: string } }>("/api/me/certificates/:id", async (req) => (await records.cancelCertificate(req.session!, req.params.id), ok));
   r.get("/api/certificates", (req) => records.listCertificatesForReview(req.session!));
+  r.put<{ Params: { id: string }; Body: { status?: string } }>("/api/certificates/:id/status", (req) => records.setCertificateStatus(req.session!, req.params.id, String(req.body?.status ?? "")));
 });
 
 // ---- Administration & Security ----
@@ -217,6 +218,8 @@ app.register(async (r) => {
   r.post<{ Params: { id: string } }>("/api/admin/accounts/:id/reset-password", (req) => admin.resetPassword(req.session!, req.params.id));
 
   r.get("/api/settings", () => admin.getSettings());
+  r.get("/api/workflows", () => admin.listWorkflows());
+  r.put<{ Body: any }>("/api/admin/workflows", (req) => admin.saveWorkflow(req.session!, req.body));
   r.put<{ Body: any }>("/api/admin/settings", (req) => admin.saveSettings(req.session!, req.body));
   r.get("/api/admin/audit", (req) => admin.listAdminAudit(req.session!));
 });

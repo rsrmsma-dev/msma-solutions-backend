@@ -400,6 +400,23 @@ export async function setReportsTo(s: Session, id: string, supervisorId: string 
 
 // ---- Documents ----
 
+/**
+ * A Professional License document with a number on it keeps the person's PRC license
+ * record (used for CPD tracking) in step: created on first record, number, type and
+ * cycle end (the license expiry) updated after. Nothing is deleted when a document is reset.
+ */
+async function syncLicense(c: Db, documentId: string) {
+  const d = (await c.query(`select * from employee_documents where id = $1`, [documentId])).rows[0];
+  if (!d || d.document_type !== "Professional License" || !d.reference_no) return;
+  const type = d.id_type?.trim() || "PRC license";
+  const existing = (await c.query(`select id from professional_licenses where employee_id = $1 order by expires_on desc nulls last limit 1`, [d.employee_id])).rows[0];
+  if (existing) {
+    await c.query(`update professional_licenses set license_type = $2, license_number = $3, expires_on = $4, cycle_end_date = coalesce($4, cycle_end_date) where id = $1`, [existing.id, type, d.reference_no, d.expires_on]);
+  } else {
+    await c.query(`insert into professional_licenses (employee_id, license_type, license_number, expires_on, cycle_end_date) values ($1, $2, $3, $4, $4)`, [d.employee_id, type, d.reference_no, d.expires_on]);
+  }
+}
+
 const daysUntil = (iso: string) => Math.round((new Date(`${iso}T00:00:00`).getTime() - new Date(`${today()}T00:00:00`).getTime()) / 86_400_000);
 
 export async function updateDocument(s: Session, id: string, action: any) {
@@ -429,6 +446,7 @@ export async function updateDocument(s: Session, id: string, action: any) {
         if (d.status !== "Submitted") throw new UserError("Only a submitted document can be verified");
         await c.query(`update employee_documents set status = 'Verified', verified_by = $2, verified_by_name = $3, verified_at = now(), note = null where id = $1`, [d.id, s.accountId, s.name]);
         await log("Verified", "Checked against the original and verified");
+        await syncLicense(c, d.id);
         break;
       case "return": {
         const note = String(action.note ?? "").trim();
@@ -451,6 +469,7 @@ export async function updateDocument(s: Session, id: string, action: any) {
         if (expiresOn && !/^\d{4}-\d{2}-\d{2}$/.test(expiresOn)) throw new UserError("Enter the expiry date as a date");
         await c.query(`update employee_documents set id_type = $2, reference_no = $3, expires_on = $4 where id = $1`, [d.id, action.idType?.trim() || null, action.referenceNo?.trim() || null, expiresOn]);
         await log("Edited", "Details updated");
+        await syncLicense(c, d.id);
         break;
       }
       case "reset":

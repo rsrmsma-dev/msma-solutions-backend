@@ -9,6 +9,7 @@ import { pool, tx } from "./db.js";
 import { seedTypes } from "./leave.js";
 import { seedShifts } from "./timekeeping.js";
 import { seedRates } from "./payroll.js";
+import { seedWorkflows } from "./admin.js";
 
 const BRANCHES = [
   { name: "Cebu HQ", code: "CEB", address: "8F Park Centrale Tower, Cebu IT Park, Lahug, Cebu City" },
@@ -60,6 +61,7 @@ await tx(async (c) => {
   await seedTypes(c);
   await seedShifts(c);
   await seedRates(c);
+  await seedWorkflows(c);
 
   for (const a of ACCOUNTS) {
     const exists = await c.query(`select 1 from user_accounts where builtin_key = $1`, [a.key]);

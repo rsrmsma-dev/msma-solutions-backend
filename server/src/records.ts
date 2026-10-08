@@ -128,10 +128,32 @@ export async function listMyCertificates(s: Session) {
   return (await pool.query(`select * from certificate_requests where employee_id = $1 order by requested_at desc`, [s.employeeNo])).rows.map(certJson);
 }
 
-/** Every request, for HR's queue. */
+/** Every request, for HR's queue, with who asked. */
 export async function listCertificatesForReview(s: Session) {
   if (!can(s, "people", "view")) return [];
-  return (await pool.query(`select * from certificate_requests order by requested_at desc`)).rows.map(certJson);
+  const { rows } = await pool.query(
+    `select r.*, e.first_name, e.last_name from certificate_requests r join employees e on e.employee_id = r.employee_id order by r.requested_at desc`,
+  );
+  return rows.map((r) => ({ ...certJson(r), employeeId: r.employee_id, employeeName: `${r.first_name} ${r.last_name}`, releasedOn: r.released_at ? new Date(r.released_at).toISOString().slice(0, 10) : undefined }));
+}
+
+const CERT_FLOW = ["Pending", "Ready for pickup", "Released"];
+
+/** HR moves a request along: waiting -> ready for pickup -> released. */
+export async function setCertificateStatus(s: Session, certId: string, status: string) {
+  demand(s, "people", "edit");
+  if (!CERT_FLOW.includes(status) || status === "Pending") throw new UserError("Choose Ready for pickup or Released");
+  return tx(async (c) => {
+    const r = (await c.query(`select * from certificate_requests where id::text = $1 for update`, [certId])).rows[0];
+    if (!r) throw new UserError("That request no longer exists", 404);
+    if (CERT_FLOW.indexOf(status) <= CERT_FLOW.indexOf(r.status)) throw new UserError(`This request is already ${r.status.toLowerCase()}`);
+    const { rows: [next] } = await c.query(
+      `update certificate_requests set status = $2, released_at = case when $2 = 'Released' then now() else released_at end where id = $1 returning *`,
+      [r.id, status],
+    );
+    await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: status === "Released" ? "Released certificate" : "Certificate ready", target: r.certificate_type, employeeNo: r.employee_id, detail: r.purpose });
+    return certJson(next);
+  });
 }
 
 export async function requestCertificate(s: Session, body: any) {

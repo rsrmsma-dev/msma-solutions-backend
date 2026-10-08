@@ -48,8 +48,8 @@ async function tempPassword(db: Db) {
 
 // ---- Roles ----
 
-export async function listRoles(withCounts: boolean) {
-  const { rows } = await pool.query(
+export async function listRoles(withCounts: boolean, db: Db = pool) {
+  const { rows } = await db.query(
     `select r.id, r.name, r.description, r.workspace, r.is_built_in as "builtIn", r.is_super_admin as "superAdmin",
             (select count(*)::int from user_accounts a where a.role_id = r.id) as users,
             coalesce(json_object_agg(m.module, m.access) filter (where m.module is not null), '{}') as access
@@ -92,7 +92,7 @@ export async function saveRole(s: Session, input: { id?: string; name?: string; 
     }
     const changes = existing ? MODULES.filter((m) => (before[m.key] ?? "none") !== access[m.key]).map((m) => `${m.label}: ${ACCESS_LABEL[(before[m.key] ?? "none") as Access]} → ${ACCESS_LABEL[access[m.key]]}`) : [];
     await log(c, s, existing ? "Changed role access" : "Added role", name, existing ? changes.join("; ") || "Name or description" : description);
-    return (await listRoles(false)).find((r: { id: string }) => r.id === id);
+    return (await listRoles(false, c)).find((r: { id: string }) => r.id === id);
   });
 }
 
@@ -320,4 +320,63 @@ export async function registerAccount(ip: string, body: any) {
     registerTries.delete(ip);
     return { username, name };
   });
+}
+
+// ---- Approval workflows ----
+
+const REQUEST_KINDS = ["leave", "overtime", "undertime", "correction", "profile"] as const;
+const WORKFLOW_NAMES: Record<string, string> = { leave: "Leave", overtime: "Overtime", undertime: "Undertime", correction: "Time correction", profile: "Profile change" };
+
+/** Who approves each kind of request. Everyone signed in reads them (the leave screens show the approval path). */
+export async function listWorkflows(db: Db = pool) {
+  // One after the other: inside a transaction the client can't run two queries at once.
+  const flows = await db.query(`select * from approval_workflows order by request_kind`);
+  const steps = await db.query(`select * from approval_workflow_steps order by request_kind, step_no`);
+  return flows.rows.map((w) => ({
+    kind: w.request_kind,
+    steps: steps.rows.filter((s) => s.request_kind === w.request_kind).map((s) => clean({ approver: s.approver_kind, roleId: s.role_id, overDays: s.over_days ?? undefined })),
+    remindAfterDays: w.remind_after_days,
+    active: w.is_active,
+  }));
+}
+
+export async function saveWorkflow(s: Session, body: any) {
+  demand(s, "administration", "edit");
+  const kind = String(body?.kind ?? "");
+  if (!(REQUEST_KINDS as readonly string[]).includes(kind)) throw new UserError("Unknown kind of request");
+  const steps: any[] = Array.isArray(body?.steps) ? body.steps : [];
+  const remind = Number(body?.remindAfterDays);
+  if (steps.length === 0) throw new UserError("Add at least one approval step");
+  if (steps.length > 3) throw new UserError("Keep it to 3 steps or fewer so requests don't get stuck");
+  return tx(async (c) => {
+    const roles = new Set((await c.query(`select id from roles`)).rows.map((r) => r.id));
+    for (const st of steps) {
+      if (!["supervisor", "department-head", "role"].includes(st?.approver)) throw new UserError("Choose who approves each step");
+      if (st.approver === "role" && !roles.has(st.roleId)) throw new UserError("Choose the role for each 'Anyone with a role' step");
+      if (st.overDays !== undefined && st.overDays !== null && (!Number.isFinite(Number(st.overDays)) || Number(st.overDays) < 1)) throw new UserError("The 'only when longer than' days must be 1 or more");
+    }
+    if (!Number.isFinite(remind) || remind < 0) throw new UserError("Reminder days must be 0 or more");
+    await c.query(
+      `insert into approval_workflows (request_kind, remind_after_days, is_active) values ($1, $2, $3)
+       on conflict (request_kind) do update set remind_after_days = excluded.remind_after_days, is_active = excluded.is_active`,
+      [kind, Math.round(remind), body?.active !== false],
+    );
+    await c.query(`delete from approval_workflow_steps where request_kind = $1`, [kind]);
+    for (const [i, st] of steps.entries()) {
+      await c.query(`insert into approval_workflow_steps (request_kind, step_no, approver_kind, role_id, over_days) values ($1,$2,$3,$4,$5)`,
+        [kind, i + 1, st.approver, st.approver === "role" ? st.roleId : null, st.overDays ? Number(st.overDays) : null]);
+    }
+    const describe = steps.map((st) => (st.approver === "role" ? `role ${st.roleId}` : st.approver) + (st.overDays ? ` (over ${st.overDays} days)` : "")).join(" → ");
+    await log(c, s, "Changed approval workflow", WORKFLOW_NAMES[kind]!, describe);
+    return (await listWorkflows(c)).find((w) => w.kind === kind);
+  });
+}
+
+/** The starting workflows: HR approves everything. Same as DEFAULT_WORKFLOWS in src/lib/admin/store.ts. */
+export async function seedWorkflows(c: Db) {
+  const defaults: [string, number][] = [["leave", 2], ["overtime", 2], ["undertime", 2], ["correction", 1], ["profile", 3]];
+  for (const [kind, remind] of defaults) {
+    const { rowCount } = await c.query(`insert into approval_workflows (request_kind, remind_after_days) values ($1, $2) on conflict do nothing`, [kind, remind]);
+    if (rowCount) await c.query(`insert into approval_workflow_steps (request_kind, step_no, approver_kind, role_id) values ($1, 1, 'role', 'hr')`, [kind]);
+  }
 }
