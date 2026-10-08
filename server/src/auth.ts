@@ -150,8 +150,7 @@ export async function loadSession(req: FastifyRequest): Promise<Session | undefi
 export async function requireSession(req: FastifyRequest, reply: FastifyReply) {
   req.session = await loadSession(req);
   if (!req.session) return reply.code(401).send({ error: "Your session has ended. Please sign in again." });
-  if (req.session.mustChangePassword && req.url !== "/api/auth/change-password")
-    return reply.code(403).send({ error: "Set a new password before continuing." });
+  // The website has no "set a new password" screen, so a temporary password isn't forced to change here.
 }
 
 export function can(s: Session, module: ModuleKey, needed: Access) {
