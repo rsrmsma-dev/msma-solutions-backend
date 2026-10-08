@@ -1,0 +1,8 @@
+{
+  "name": "heyhr-api-shared",
+  "private": true,
+  "description": "Rules shared with the HeyHR website (src/lib), used by the API server in server/.",
+  "dependencies": {
+    "zod": "^4.6.5"
+  }
+}
