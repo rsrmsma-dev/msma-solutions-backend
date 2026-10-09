@@ -79,7 +79,7 @@ for d in DOMAINS:
             body.append(s)
             if c["fk"]:
                 tgt, tcol = c["fk"]
-                if (name in ("remote_work_day_branches", "role_module_access", "approval_workflow_steps", "payroll_run_lines") and c["pk"] and tgt != "employees") or name == "user_sessions":
+                if (name in ("remote_work_day_branches", "approval_workflow_steps", "payroll_run_lines") and c["pk"] and tgt != "employees") or name in ("user_sessions", "mfa_backup_codes"):
                     ondel = "CASCADE"  # rows that only exist as part of their parent
                 elif not (c["nn"] or c["pk"]):
                     ondel = "SET NULL"
@@ -113,6 +113,8 @@ lines += ["-- Extra integrity rules",
 "ALTER TABLE reimbursement_claims ADD CHECK (category <> 'Other' OR other_type IS NOT NULL);",
 "ALTER TABLE approval_workflow_steps ADD CHECK (approver_kind <> 'role' OR role_id IS NOT NULL);",
 "ALTER TABLE contribution_rate_versions ADD UNIQUE (agency, effective_from);",
+"ALTER TABLE subscriptions ADD CHECK (seat_limit IS NULL OR seat_limit > 0);",
+"ALTER TABLE subscriptions ADD CHECK (price_per_seat IS NULL OR price_per_seat >= 0);",
 "",
 "-- New Employees Template rules (BRD v1.1, 11.2.1)",
 "ALTER TABLE employees ADD CONSTRAINT employees_names_letters CHECK (last_name ~ $re$^[[:alpha:] .'-]+$$re$ AND first_name ~ $re$^[[:alpha:] .'-]+$$re$ AND (middle_name IS NULL OR middle_name ~ $re$^[[:alpha:] .'-]+$$re$));",

@@ -1,5 +1,5 @@
-// Reimbursements: expense claims employees file with a photo of the POS receipt,
-// approved in the HR workspace. Saved to localStorage, receipts as compressed JPEG data URLs;
+// Reimbursements: expense claims employees file with a photo of the POS receipt. Two approvals:
+// the employee's approver (supervisor) first, then Accounting's final approval. HR isn't involved. Saved to localStorage, receipts as compressed JPEG data URLs;
 // with the API server, in the database (receipts served from /api/files).
 
 import { api, serverMode } from "../http";
@@ -7,7 +7,8 @@ import { api, serverMode } from "../http";
 export const CATEGORIES = ["Transportation", "Meals & client meetings", "Office supplies", "Communication", "Training & seminars", "Medical", "Other"] as const;
 export type Category = (typeof CATEGORIES)[number];
 
-export type ClaimStatus = "pending" | "approved" | "rejected";
+/** pending: waiting for the approver · endorsed: approver said yes, waiting for Accounting · approved: final. */
+export type ClaimStatus = "pending" | "endorsed" | "approved" | "rejected";
 
 export interface Claim {
   id: string;
@@ -24,6 +25,11 @@ export interface Claim {
   receipt: string;
   status: ClaimStatus;
   filedAt: string;
+  /** Step 1: the approver (supervisor). */
+  approverDecidedBy?: string;
+  approverDecidedAt?: string;
+  approverNote?: string;
+  /** The final decision (Accounting), or the approver's when they declined. */
   decidedBy?: string;
   decidedAt?: string;
   note?: string;
@@ -34,6 +40,7 @@ export const claimType = (c: Pick<Claim, "category" | "otherType">) => (c.catego
 
 export { CLAIM_WINDOW_DAYS, MAX_AMOUNT } from "./rules";
 
+// v2: cleared with the rest of the sample data.
 const KEY = "heyhr-reimbursements-v2";
 
 function load(): Claim[] {
@@ -50,7 +57,7 @@ function load(): Claim[] {
 
 export let claims: Claim[] = load();
 
-/** With the API server: your own claims, or everyone's with Reimbursements access. Receipts load from /api/files. */
+/** With the API server: the claims this account may see. Receipts load from /api/files. */
 export async function refreshClaims() {
   if (serverMode) claims = await api<Claim[]>("GET", "/reimbursements/claims");
 }

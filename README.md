@@ -43,10 +43,13 @@ Other scripts (in `server/`):
 - `npm run seed`: loads the starting setup (company settings, org structure, positions,
   roles, built-in sign-ins, leave types, shifts, contribution tables). Safe to re-run.
 - `npm run set-password -- <username> <password>`: sets an account's password.
+- `npm run encrypt-ids`: encrypts anything saved before encryption came in (after migrations 009–012). Safe to re-run.
+- `backup-db.ps1`: backs up the database with `pg_dump` (checks the file opens, keeps 14 days);
+  `-Install` schedules it every night at 1:00 AM. How to restore is at the top of the script.
 
 ## Database
 
-- `database/schema.sql`: the whole schema (46 tables); every table and column is described,
+- `database/schema.sql`: the whole schema (46 tables, migrations 001–013 included); every table and column is described,
   so `\dt+` and `\d+` in psql show what each is for.
 - `database/DATA_DICTIONARY.md`: the same descriptions as a document.
 - `database/PSQL_CHEATSHEET.md`: commands for looking at the database.
@@ -54,11 +57,26 @@ Other scripts (in `server/`):
   `python database/tools/gen.py database`.
 - The `employees` table follows the BRD New Employees Template (v1.1, 11.2.1).
 
+## Roles
+
+Six fixed roles: System Admin, Super Admin, HR, Approver, Accounting, Employee. What each may do
+is the access matrix in `src/lib/permissions.ts`, the same file the website reads, so pages and the
+API always agree. Approvers act on their team (the people whose supervisor they are).
+
 ## Security notes
 
 - Passwords are stored as Argon2 hashes; sessions are HttpOnly cookies, only a hash is kept.
-- Every module checks the signed-in role's access; employees see and change only their own records.
-- `server/.env` holds the database password and is never committed.
+- Every request is checked against the access matrix on the server.
+- **Encryption:** government numbers, ID and license numbers, uploaded files and their names,
+  leave reasons and case reasons are encrypted by the server (`server/src/crypto.ts`, AES-256-GCM)
+  with `HEYHR_DATA_KEY` in `server/.env`. `setup-db.ps1` creates the key. Keep a copy of it
+  somewhere safe and apart from the backups: without it that data can't be read back. New
+  sensitive fields (e.g. face or fingerprint templates, bank accounts) should use `seal`/`open`
+  from that file.
+- **Two-factor sign-in (MFA)** with an authenticator app; the server side is done, see `server/MFA.md`.
+- Sign-in: per-account lock and a per-network limit (set `TRUST_PROXY=1` behind a reverse proxy).
+  The app's database login can't change or delete audit entries.
+- `server/.env` holds the database password and the encryption key and is never committed.
 - The built-in sign-ins in `server/src/seed.ts` are for first setup; change their passwords
   before real use.
 - Payroll is computed in the browser, then checked and locked by the server; the server does

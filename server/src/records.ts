@@ -1,7 +1,8 @@
 // Employee self-service records: announcements, benefits, trainings, PRC licenses
 // (CPD units) and certificate requests. Shapes match src/lib/types.ts.
 
-import { audit, can, demand, type Session } from "./auth";
+import { audit, can, demand, seen, type Session } from "./auth";
+import { open } from "./crypto";
 import { clean, pool, tx, UserError } from "./db";
 
 /** "2026-10-15" -> "Oct 15, 2026", the way the pages show dates in these lists. */
@@ -12,7 +13,7 @@ const me = (s: Session) => {
 };
 const initials = (first: string, last: string) => `${first[0] ?? ""}${last[0] ?? ""}`.toUpperCase();
 
-// ---- Announcements (everyone reads; People edit posts) ----
+// ---- Announcements (everyone reads; HR and Super Admin post) ----
 
 export async function listAnnouncements() {
   const { rows } = await pool.query(`select * from announcements where expires_at is null or expires_at > now() order by posted_at desc limit 50`);
@@ -20,7 +21,7 @@ export async function listAnnouncements() {
 }
 
 export async function postAnnouncement(s: Session, body: any) {
-  demand(s, "people", "edit");
+  demand(s, "create", "announcements");
   const title = String(body?.title ?? "").trim();
   if (!title) throw new UserError("Write the announcement");
   if (title.length > 200) throw new UserError("Keep it under 200 characters");
@@ -80,7 +81,7 @@ export async function setTrainingStatus(s: Session, trainingId: string, status: 
   return tx(async (c) => {
     const t = (await c.query(`select * from training_records where id::text = $1 for update`, [trainingId])).rows[0];
     if (!t) throw new UserError("That training no longer exists", 404);
-    if (t.employee_id !== s.employeeNo) demand(s, "people", "edit");
+    if (t.employee_id !== s.employeeNo) demand(s, "edit", "trainings", t.employee_id);
     await c.query(`update training_records set status = $2, completed_on = case when $2 = 'Completed' then current_date else null end where id = $1`, [t.id, status]);
     const r = (await c.query(`select t.*, e.first_name, e.last_name from training_records t join employees e on e.employee_id = t.employee_id where t.id = $1`, [t.id])).rows[0];
     return trainingJson(r);
@@ -91,7 +92,7 @@ export async function setTrainingStatus(s: Session, trainingId: string, status: 
 
 const licenseJson = (l: any) => ({
   id: l.id, employeeId: l.employee_id, employeeName: `${l.first_name} ${l.last_name}`, employeeInitials: initials(l.first_name, l.last_name),
-  licenseType: l.license_type, licenseNumber: l.license_number, cpdUnitsEarned: l.cpd_units_earned, cpdUnitsRequired: l.cpd_units_required, cycleEndDate: label(l.cycle_end_date),
+  licenseType: l.license_type, licenseNumber: open(l.license_number), cpdUnitsEarned: l.cpd_units_earned, cpdUnitsRequired: l.cpd_units_required, cycleEndDate: label(l.cycle_end_date),
 });
 const LICENSE_SELECT = `select l.*, e.first_name, e.last_name from professional_licenses l join employees e on e.employee_id = l.employee_id`;
 
@@ -102,8 +103,8 @@ export async function myLicense(s: Session) {
 }
 
 export async function listLicenses(s: Session) {
-  if (!(can(s, "people", "view") || can(s, "documents", "view"))) return [];
-  return (await pool.query(`${LICENSE_SELECT} order by e.last_name`)).rows.map(licenseJson);
+  const { rows } = await pool.query(`${LICENSE_SELECT} order by e.last_name`);
+  return [...new Map([...seen(s, "people", rows, (l) => l.employee_id), ...seen(s, "documents", rows, (l) => l.employee_id)].map((l) => [l.id, l])).values()].map(licenseJson);
 }
 
 export async function setCpdUnits(s: Session, licenseId: string, units: unknown) {
@@ -112,7 +113,7 @@ export async function setCpdUnits(s: Session, licenseId: string, units: unknown)
   return tx(async (c) => {
     const l = (await c.query(`select * from professional_licenses where id::text = $1 for update`, [licenseId])).rows[0];
     if (!l) throw new UserError("That license no longer exists", 404);
-    if (l.employee_id !== s.employeeNo) demand(s, "people", "edit");
+    if (l.employee_id !== s.employeeNo) demand(s, "edit", "people", l.employee_id);
     await c.query(`update professional_licenses set cpd_units_earned = $2 where id = $1`, [l.id, Math.round(n * 10) / 10]);
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: "Professional license", employeeNo: l.employee_id, detail: `CPD units: ${l.cpd_units_earned} → ${Math.round(n * 10) / 10}` });
     return licenseJson((await c.query(`${LICENSE_SELECT} where l.id = $1`, [l.id])).rows[0]);
@@ -130,7 +131,7 @@ export async function listMyCertificates(s: Session) {
 
 /** Every request, for HR's queue, with who asked. */
 export async function listCertificatesForReview(s: Session) {
-  if (!can(s, "people", "view")) return [];
+  if (!can(s, "edit", "selfService")) return [];
   const { rows } = await pool.query(
     `select r.*, e.first_name, e.last_name from certificate_requests r join employees e on e.employee_id = r.employee_id order by r.requested_at desc`,
   );
@@ -141,7 +142,7 @@ const CERT_FLOW = ["Pending", "Ready for pickup", "Released"];
 
 /** HR moves a request along: waiting -> ready for pickup -> released. */
 export async function setCertificateStatus(s: Session, certId: string, status: string) {
-  demand(s, "people", "edit");
+  demand(s, "edit", "selfService");
   if (!CERT_FLOW.includes(status) || status === "Pending") throw new UserError("Choose Ready for pickup or Released");
   return tx(async (c) => {
     const r = (await c.query(`select * from certificate_requests where id::text = $1 for update`, [certId])).rows[0];

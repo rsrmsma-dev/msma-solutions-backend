@@ -13,7 +13,7 @@ CREATE TABLE schema_migrations (version text PRIMARY KEY, applied_at timestamptz
 -- Company & organization
 -- ======================================================================
 
--- Single row of company-wide settings: identity, sign-in security and tardiness flags.
+-- Single row of company-wide settings: identity, sign-in security, working time and tardiness flags.
 CREATE TABLE company_settings (
   id smallint PRIMARY KEY DEFAULT 1 CHECK (id IN (1)),
   company_name text NOT NULL,
@@ -27,7 +27,15 @@ CREATE TABLE company_settings (
   tardy_consecutive_days smallint NOT NULL DEFAULT 3,
   tardy_per_month smallint NOT NULL DEFAULT 5,
   updated_at timestamptz NOT NULL DEFAULT now(),
-  updated_by uuid
+  updated_by uuid,
+  logo_file_id uuid,
+  default_timezone text NOT NULL DEFAULT 'Asia/Manila',
+  currency text NOT NULL DEFAULT 'PHP',
+  work_week smallint[] NOT NULL DEFAULT '{1,2,3,4,5}',
+  work_start time NOT NULL DEFAULT '08:30',
+  work_end time NOT NULL DEFAULT '17:30',
+  fiscal_year_start_month smallint NOT NULL DEFAULT 1,
+  retention_months smallint NOT NULL DEFAULT 0
 );
 
 -- The organization tree: one company, its branches, their departments and teams (clusters).
@@ -82,10 +90,14 @@ CREATE TABLE employees (
   email varchar(100) NOT NULL UNIQUE,
   date_hired date NOT NULL,
   employment_status varchar(12) NOT NULL DEFAULT 'PROBATIONARY' CHECK (employment_status IN ('PROBATIONARY', 'REGULAR', 'FIXED_TERM')),
-  tin varchar(17) UNIQUE,
-  sss_no varchar(12) UNIQUE,
-  philhealth_no varchar(14) UNIQUE,
-  pagibig_no varchar(14) UNIQUE,
+  tin text,
+  sss_no text,
+  philhealth_no text,
+  pagibig_no text,
+  tin_hash text UNIQUE,
+  sss_no_hash text UNIQUE,
+  philhealth_no_hash text UNIQUE,
+  pagibig_no_hash text UNIQUE,
   basic_rate numeric(12,2) NOT NULL,
   nationality varchar(50) NOT NULL DEFAULT 'Filipino',
   photo_file_id uuid,
@@ -527,7 +539,7 @@ CREATE TABLE payroll_adjustments (
   reimbursement_claim_id uuid
 );
 
--- Expense claims with a receipt photo.
+-- Expense claims with a receipt photo. The employee's approver endorses them, then Accounting gives the final approval.
 CREATE TABLE reimbursement_claims (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   employee_id varchar(20) NOT NULL,
@@ -538,34 +550,51 @@ CREATE TABLE reimbursement_claims (
   amount numeric(10,2) NOT NULL,
   description text NOT NULL,
   receipt_file_id uuid NOT NULL,
-  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'endorsed', 'approved', 'rejected')),
   filed_at timestamptz NOT NULL DEFAULT now(),
   decided_by uuid,
   decided_by_name text,
   decided_at timestamptz,
-  decision_note text
+  decision_note text,
+  approver_decided_by uuid,
+  approver_decided_by_name text,
+  approver_decided_at timestamptz,
+  approver_note text
 );
 
 -- ======================================================================
 -- Access, workflows & audit
 -- ======================================================================
 
--- Roles that set a user's workspace and module access.
+-- The company's HRIS plan (SaaS): plan, seat limit and billing period. One row per period; the newest one not cancelled or expired is current.
+CREATE TABLE subscriptions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  plan_name text NOT NULL,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('trial', 'active', 'past_due', 'cancelled', 'expired')),
+  seat_limit integer,
+  billing_cycle text NOT NULL DEFAULT 'monthly' CHECK (billing_cycle IN ('monthly', 'yearly')),
+  price_per_seat numeric(10,2),
+  currency text NOT NULL DEFAULT 'PHP',
+  starts_on date NOT NULL DEFAULT current_date,
+  current_period_end date,
+  trial_ends_on date,
+  cancelled_at timestamptz,
+  notes text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  created_by uuid,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by uuid
+);
+
+-- The six fixed roles. What each may do is the access matrix in the app (src/lib/permissions.ts).
 CREATE TABLE roles (
   id text PRIMARY KEY,
+  role_key text NOT NULL UNIQUE CHECK (role_key IN ('system_admin', 'super_admin', 'hr', 'approver', 'accounting', 'employee')),
   name text NOT NULL UNIQUE,
   description text NOT NULL,
   workspace text NOT NULL CHECK (workspace IN ('employee', 'manager', 'admin')),
   is_built_in boolean NOT NULL DEFAULT false,
   is_super_admin boolean NOT NULL DEFAULT false
-);
-
--- Access a role has to each HR-workspace module.
-CREATE TABLE role_module_access (
-  role_id text NOT NULL,
-  module text NOT NULL CHECK (module IN ('people', 'company', 'documents', 'timekeeping', 'leave', 'reimbursements', 'reports', 'payroll', 'administration')),
-  access text NOT NULL DEFAULT 'none' CHECK (access IN ('none', 'view', 'edit', 'approve')),
-  PRIMARY KEY (role_id, module)
 );
 
 -- Sign-in accounts. Linked to an employee when the user is one.
@@ -582,7 +611,11 @@ CREATE TABLE user_accounts (
   last_sign_in_at timestamptz,
   failed_attempts smallint NOT NULL DEFAULT 0,
   locked_until timestamptz,
-  created_at timestamptz NOT NULL DEFAULT now()
+  created_at timestamptz NOT NULL DEFAULT now(),
+  mfa_secret text,
+  mfa_pending_secret text,
+  mfa_enabled_at timestamptz,
+  mfa_last_step bigint
 );
 
 -- Signed-in sessions. The browser holds the token in an HttpOnly cookie; only its hash is stored.
@@ -592,7 +625,17 @@ CREATE TABLE user_sessions (
   created_at timestamptz NOT NULL DEFAULT now(),
   last_seen_at timestamptz NOT NULL DEFAULT now(),
   expires_at timestamptz NOT NULL,
-  user_agent text
+  user_agent text,
+  mfa_pending boolean NOT NULL DEFAULT false
+);
+
+-- One-time backup codes for two-factor sign-in, for when the phone is lost. Only hashes are stored.
+CREATE TABLE mfa_backup_codes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id uuid NOT NULL,
+  code_hash text NOT NULL,
+  used_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
 -- How each kind of request gets approved.
@@ -665,7 +708,7 @@ CREATE TABLE job_requisitions (
 );
 
 -- What each table and column is for (shown by \dt+ and \d+ in psql)
-COMMENT ON TABLE company_settings IS 'Single row of company-wide settings: identity, sign-in security and tardiness flags.';
+COMMENT ON TABLE company_settings IS 'Single row of company-wide settings: identity, sign-in security, working time and tardiness flags.';
 COMMENT ON COLUMN company_settings.id IS 'Always 1; the table holds one row.';
 COMMENT ON COLUMN company_settings.company_name IS 'Legal or trade name shown on payslips and certificates.';
 COMMENT ON COLUMN company_settings.tin IS 'Company TIN, 000-000-000-00000.';
@@ -679,6 +722,14 @@ COMMENT ON COLUMN company_settings.tardy_consecutive_days IS 'Flag someone late 
 COMMENT ON COLUMN company_settings.tardy_per_month IS 'Flag someone late this many times in a month (0 = off).';
 COMMENT ON COLUMN company_settings.updated_at IS 'Last change.';
 COMMENT ON COLUMN company_settings.updated_by IS 'Account that made the last change.';
+COMMENT ON COLUMN company_settings.logo_file_id IS 'Company logo (Settings > Organization).';
+COMMENT ON COLUMN company_settings.default_timezone IS 'Timezone for anyone who hasn''t picked their own.';
+COMMENT ON COLUMN company_settings.currency IS 'Currency shown on amounts; payroll is computed in PHP.';
+COMMENT ON COLUMN company_settings.work_week IS 'Working days, 0 = Sunday to 6 = Saturday. Leave counts only these days.';
+COMMENT ON COLUMN company_settings.work_start IS 'Usual start of the working day.';
+COMMENT ON COLUMN company_settings.work_end IS 'Usual end of the working day.';
+COMMENT ON COLUMN company_settings.fiscal_year_start_month IS 'Month the fiscal year starts, 1 = January.';
+COMMENT ON COLUMN company_settings.retention_months IS 'Keep records this many months after separation (0 = keep everything).';
 COMMENT ON TABLE org_units IS 'The organization tree: one company, its branches, their departments and teams (clusters).';
 COMMENT ON COLUMN org_units.id IS 'Primary key.';
 COMMENT ON COLUMN org_units.unit_type IS 'Level in the tree.';
@@ -717,10 +768,14 @@ COMMENT ON COLUMN employees.mobile_no IS 'BRD. Mobile number, 11 digits: 09XXXXX
 COMMENT ON COLUMN employees.email IS 'BRD. Email address (work). Valid email format. Unique.';
 COMMENT ON COLUMN employees.date_hired IS 'BRD. First day of employment. Not more than 30 days in the future (checked by trigger).';
 COMMENT ON COLUMN employees.employment_status IS 'BRD. Employment type.';
-COMMENT ON COLUMN employees.tin IS 'BRD. Tax Identification Number. Required before first payroll. Unique.';
-COMMENT ON COLUMN employees.sss_no IS 'BRD. SSS number. Required before first payroll. Unique.';
-COMMENT ON COLUMN employees.philhealth_no IS 'BRD. PhilHealth number. Required before first payroll. Unique.';
-COMMENT ON COLUMN employees.pagibig_no IS 'BRD. Pag-IBIG MID number. Required before first payroll. Unique.';
+COMMENT ON COLUMN employees.tin IS 'BRD. Tax Identification Number, encrypted by the app (AES-256-GCM). Required before first payroll.';
+COMMENT ON COLUMN employees.sss_no IS 'BRD. SSS number, encrypted by the app (AES-256-GCM). Required before first payroll.';
+COMMENT ON COLUMN employees.philhealth_no IS 'BRD. PhilHealth number, encrypted by the app (AES-256-GCM). Required before first payroll.';
+COMMENT ON COLUMN employees.pagibig_no IS 'BRD. Pag-IBIG MID number, encrypted by the app (AES-256-GCM). Required before first payroll.';
+COMMENT ON COLUMN employees.tin_hash IS 'Fingerprint of the TIN (HMAC-SHA256), so no two employees share one.';
+COMMENT ON COLUMN employees.sss_no_hash IS 'Fingerprint of the SSS number (HMAC-SHA256), so no two employees share one.';
+COMMENT ON COLUMN employees.philhealth_no_hash IS 'Fingerprint of the PhilHealth number (HMAC-SHA256), so no two employees share one.';
+COMMENT ON COLUMN employees.pagibig_no_hash IS 'Fingerprint of the Pag-IBIG MID (HMAC-SHA256), so no two employees share one.';
 COMMENT ON COLUMN employees.basic_rate IS 'BRD. Basic monthly salary in PHP; must be > 0. Restricted to HR and Payroll.';
 COMMENT ON COLUMN employees.nationality IS 'Nationality.';
 COMMENT ON COLUMN employees.photo_file_id IS 'ID photo.';
@@ -752,11 +807,11 @@ COMMENT ON COLUMN dependents.hmo_enrolled IS 'Enrolled as an HMO dependent.';
 COMMENT ON TABLE files IS 'Uploaded files: documents, receipts, photos. Kept in `content` for now; object storage later.';
 COMMENT ON COLUMN files.id IS 'Primary key.';
 COMMENT ON COLUMN files.storage_key IS 'Object-storage key.';
-COMMENT ON COLUMN files.file_name IS 'Original file name.';
+COMMENT ON COLUMN files.file_name IS 'Original file name, encrypted by the app (AES-256-GCM).';
 COMMENT ON COLUMN files.content_type IS 'MIME type.';
 COMMENT ON COLUMN files.size_bytes IS 'File size.';
 COMMENT ON COLUMN files.sha256 IS 'Checksum, to catch duplicates.';
-COMMENT ON COLUMN files.content IS 'The file itself, while files are kept in the database (null once moved to object storage).';
+COMMENT ON COLUMN files.content IS 'The file itself, encrypted by the app (AES-256-GCM), while files are kept in the database (null once moved to object storage).';
 COMMENT ON COLUMN files.uploaded_by IS 'Account that uploaded it.';
 COMMENT ON COLUMN files.uploaded_at IS 'Upload time.';
 COMMENT ON TABLE employee_documents IS 'Pre-employment and identity documents in the 201 File checklist.';
@@ -765,13 +820,13 @@ COMMENT ON COLUMN employee_documents.employee_id IS 'The employee this belongs t
 COMMENT ON COLUMN employee_documents.document_type IS 'Checklist item.';
 COMMENT ON COLUMN employee_documents.status IS 'Where it stands.';
 COMMENT ON COLUMN employee_documents.file_id IS 'The uploaded scan.';
-COMMENT ON COLUMN employee_documents.file_name IS 'Name of the submitted file.';
+COMMENT ON COLUMN employee_documents.file_name IS 'Name of the submitted file, encrypted by the app (AES-256-GCM).';
 COMMENT ON COLUMN employee_documents.submitted_at IS 'When it was uploaded.';
 COMMENT ON COLUMN employee_documents.verified_by IS 'HR account that verified it.';
 COMMENT ON COLUMN employee_documents.verified_by_name IS 'Name of who verified it, kept if the account goes.';
 COMMENT ON COLUMN employee_documents.verified_at IS 'When it was verified.';
 COMMENT ON COLUMN employee_documents.id_type IS 'For government IDs: UMID, Passport, Driver''s License…';
-COMMENT ON COLUMN employee_documents.reference_no IS 'ID or license number. Sensitive.';
+COMMENT ON COLUMN employee_documents.reference_no IS 'ID or license number, encrypted by the app (AES-256-GCM).';
 COMMENT ON COLUMN employee_documents.expires_on IS 'Expiry of the ID, license or clearance; drives renewal alerts.';
 COMMENT ON COLUMN employee_documents.note IS 'HR note.';
 COMMENT ON TABLE job_events IS 'Employment history: hires, promotions, transfers, salary changes, separations.';
@@ -788,7 +843,7 @@ COMMENT ON TABLE professional_licenses IS 'PRC licenses (CPA, lawyer) and CPD un
 COMMENT ON COLUMN professional_licenses.id IS 'Primary key.';
 COMMENT ON COLUMN professional_licenses.employee_id IS 'The employee this belongs to.';
 COMMENT ON COLUMN professional_licenses.license_type IS 'e.g. CPA.';
-COMMENT ON COLUMN professional_licenses.license_number IS 'PRC license number.';
+COMMENT ON COLUMN professional_licenses.license_number IS 'PRC license number, encrypted by the app (AES-256-GCM).';
 COMMENT ON COLUMN professional_licenses.expires_on IS 'License validity.';
 COMMENT ON COLUMN professional_licenses.cpd_units_earned IS 'CPD units earned this cycle.';
 COMMENT ON COLUMN professional_licenses.cpd_units_required IS 'CPD units required for renewal.';
@@ -820,7 +875,7 @@ COMMENT ON COLUMN employee_cases.id IS 'Primary key.';
 COMMENT ON COLUMN employee_cases.employee_id IS 'The employee this belongs to.';
 COMMENT ON COLUMN employee_cases.case_type IS 'Kind of case.';
 COMMENT ON COLUMN employee_cases.status IS 'Case status.';
-COMMENT ON COLUMN employee_cases.summary IS 'What happened and what was done.';
+COMMENT ON COLUMN employee_cases.summary IS 'What happened and what was done, encrypted by the app (AES-256-GCM).';
 COMMENT ON COLUMN employee_cases.filed_by IS 'Account that filed it.';
 COMMENT ON COLUMN employee_cases.filed_on IS 'Filing date.';
 COMMENT ON TABLE company_assets IS 'Laptops, IDs, access cards and phones issued to employees.';
@@ -835,7 +890,7 @@ COMMENT ON TABLE offboarding_cases IS 'Resignations and separations with clearan
 COMMENT ON COLUMN offboarding_cases.id IS 'Primary key.';
 COMMENT ON COLUMN offboarding_cases.employee_id IS 'The employee this belongs to.';
 COMMENT ON COLUMN offboarding_cases.separation_type IS 'e.g. Voluntary resignation.';
-COMMENT ON COLUMN offboarding_cases.reason IS 'Stated reason.';
+COMMENT ON COLUMN offboarding_cases.reason IS 'Stated reason, encrypted by the app (AES-256-GCM).';
 COMMENT ON COLUMN offboarding_cases.notice_filed_on IS 'When notice was given (30-day rule).';
 COMMENT ON COLUMN offboarding_cases.last_day IS 'Last working day.';
 COMMENT ON COLUMN offboarding_cases.stage IS 'Where it stands.';
@@ -976,9 +1031,9 @@ COMMENT ON COLUMN leave_requests.date_from IS 'First day.';
 COMMENT ON COLUMN leave_requests.date_to IS 'Last day.';
 COMMENT ON COLUMN leave_requests.half_day IS 'Half day, only when the dates are equal.';
 COMMENT ON COLUMN leave_requests.days IS 'Days charged, after skipping rest days and holidays.';
-COMMENT ON COLUMN leave_requests.reason IS 'Reason.';
+COMMENT ON COLUMN leave_requests.reason IS 'Reason, encrypted by the app (AES-256-GCM): it can describe an illness.';
 COMMENT ON COLUMN leave_requests.attachment_file_id IS 'Medical certificate or other proof.';
-COMMENT ON COLUMN leave_requests.attachment_name IS 'Name of the attached file.';
+COMMENT ON COLUMN leave_requests.attachment_name IS 'Name of the attached file, encrypted by the app (AES-256-GCM).';
 COMMENT ON COLUMN leave_requests.status IS 'Status.';
 COMMENT ON COLUMN leave_requests.filed_by IS 'Account that filed it (the employee or HR).';
 COMMENT ON COLUMN leave_requests.filed_by_name IS 'Name of who filed it.';
@@ -1053,7 +1108,7 @@ COMMENT ON COLUMN payroll_adjustments.amount IS 'Positive adds, negative deducts
 COMMENT ON COLUMN payroll_adjustments.is_taxable IS 'Taxable items go into gross before tax.';
 COMMENT ON COLUMN payroll_adjustments.reason IS 'Why.';
 COMMENT ON COLUMN payroll_adjustments.reimbursement_claim_id IS 'Claim being paid, if any.';
-COMMENT ON TABLE reimbursement_claims IS 'Expense claims with a receipt photo.';
+COMMENT ON TABLE reimbursement_claims IS 'Expense claims with a receipt photo. The employee''s approver endorses them, then Accounting gives the final approval.';
 COMMENT ON COLUMN reimbursement_claims.id IS 'Primary key.';
 COMMENT ON COLUMN reimbursement_claims.employee_id IS 'The employee this belongs to.';
 COMMENT ON COLUMN reimbursement_claims.category IS 'Expense category.';
@@ -1063,27 +1118,45 @@ COMMENT ON COLUMN reimbursement_claims.purchase_date IS 'Date on the receipt (wi
 COMMENT ON COLUMN reimbursement_claims.amount IS 'Amount claimed (max 50,000).';
 COMMENT ON COLUMN reimbursement_claims.description IS 'What it was for.';
 COMMENT ON COLUMN reimbursement_claims.receipt_file_id IS 'Receipt photo.';
-COMMENT ON COLUMN reimbursement_claims.status IS 'Status.';
+COMMENT ON COLUMN reimbursement_claims.status IS 'Waiting for the approver, endorsed (waiting for Accounting), approved or rejected.';
 COMMENT ON COLUMN reimbursement_claims.filed_at IS 'When filed.';
 COMMENT ON COLUMN reimbursement_claims.decided_by IS 'Account that approved or declined it.';
 COMMENT ON COLUMN reimbursement_claims.decided_by_name IS 'Name of who decided, kept if the account goes.';
 COMMENT ON COLUMN reimbursement_claims.decided_at IS 'When it was decided.';
 COMMENT ON COLUMN reimbursement_claims.decision_note IS 'Note from the approver to the employee.';
-COMMENT ON TABLE roles IS 'Roles that set a user''s workspace and module access.';
-COMMENT ON COLUMN roles.id IS 'Role key, e.g. super-admin, hr.';
+COMMENT ON COLUMN reimbursement_claims.approver_decided_by IS 'Approver (the employee''s supervisor) who endorsed or rejected it.';
+COMMENT ON COLUMN reimbursement_claims.approver_decided_by_name IS 'Name of that approver, kept if the account goes.';
+COMMENT ON COLUMN reimbursement_claims.approver_decided_at IS 'When the approver decided.';
+COMMENT ON COLUMN reimbursement_claims.approver_note IS 'The approver''s note.';
+COMMENT ON TABLE subscriptions IS 'The company''s HRIS plan (SaaS): plan, seat limit and billing period. One row per period; the newest one not cancelled or expired is current.';
+COMMENT ON COLUMN subscriptions.id IS 'Primary key.';
+COMMENT ON COLUMN subscriptions.plan_name IS 'Plan the company is on, e.g. Starter, Business.';
+COMMENT ON COLUMN subscriptions.status IS 'Trial, active, past due (payment late), cancelled or expired.';
+COMMENT ON COLUMN subscriptions.seat_limit IS 'Most sign-in accounts the plan covers (System Admin accounts don''t count); empty = no limit.';
+COMMENT ON COLUMN subscriptions.billing_cycle IS 'How often it''s billed.';
+COMMENT ON COLUMN subscriptions.price_per_seat IS 'Price per seat per billing cycle.';
+COMMENT ON COLUMN subscriptions.currency IS 'Currency of the price.';
+COMMENT ON COLUMN subscriptions.starts_on IS 'First day of this subscription.';
+COMMENT ON COLUMN subscriptions.current_period_end IS 'When the current billing period ends (renewal date).';
+COMMENT ON COLUMN subscriptions.trial_ends_on IS 'Last day of the trial, while on trial.';
+COMMENT ON COLUMN subscriptions.cancelled_at IS 'When it was cancelled.';
+COMMENT ON COLUMN subscriptions.notes IS 'Notes from our team, e.g. the contract or invoice reference.';
+COMMENT ON COLUMN subscriptions.created_at IS 'When the row was created.';
+COMMENT ON COLUMN subscriptions.created_by IS 'Account that set it up.';
+COMMENT ON COLUMN subscriptions.updated_at IS 'Last change.';
+COMMENT ON COLUMN subscriptions.updated_by IS 'Account that made the last change.';
+COMMENT ON TABLE roles IS 'The six fixed roles. What each may do is the access matrix in the app (src/lib/permissions.ts).';
+COMMENT ON COLUMN roles.id IS 'Role id, e.g. super-admin, hr.';
+COMMENT ON COLUMN roles.role_key IS 'Which of the six roles, as the access matrix names it.';
 COMMENT ON COLUMN roles.name IS 'Display name.';
 COMMENT ON COLUMN roles.description IS 'What the role is for.';
 COMMENT ON COLUMN roles.workspace IS 'Workspace it signs into.';
 COMMENT ON COLUMN roles.is_built_in IS 'Built-in roles can''t be deleted.';
 COMMENT ON COLUMN roles.is_super_admin IS 'Manages roles, settings and other super admins.';
-COMMENT ON TABLE role_module_access IS 'Access a role has to each HR-workspace module.';
-COMMENT ON COLUMN role_module_access.role_id IS 'The role.';
-COMMENT ON COLUMN role_module_access.module IS 'Module.';
-COMMENT ON COLUMN role_module_access.access IS 'Level.';
 COMMENT ON TABLE user_accounts IS 'Sign-in accounts. Linked to an employee when the user is one.';
 COMMENT ON COLUMN user_accounts.id IS 'Primary key.';
 COMMENT ON COLUMN user_accounts.username IS 'Sign-in name.';
-COMMENT ON COLUMN user_accounts.builtin_key IS 'Marks the four built-in accounts.';
+COMMENT ON COLUMN user_accounts.builtin_key IS 'Marks the accounts created at setup.';
 COMMENT ON COLUMN user_accounts.display_name IS 'Name shown in the app.';
 COMMENT ON COLUMN user_accounts.password_hash IS 'Argon2id or bcrypt hash; never the password.';
 COMMENT ON COLUMN user_accounts.employee_id IS 'Employee record, if any.';
@@ -1094,6 +1167,10 @@ COMMENT ON COLUMN user_accounts.last_sign_in_at IS 'Last successful sign-in.';
 COMMENT ON COLUMN user_accounts.failed_attempts IS 'Failed sign-ins since the last success.';
 COMMENT ON COLUMN user_accounts.locked_until IS 'Locked until this time.';
 COMMENT ON COLUMN user_accounts.created_at IS 'When the row was created.';
+COMMENT ON COLUMN user_accounts.mfa_secret IS 'Authenticator-app (TOTP) secret once two-factor sign-in is on, encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN user_accounts.mfa_pending_secret IS 'Secret being set up, until the first code confirms it; encrypted by the app.';
+COMMENT ON COLUMN user_accounts.mfa_enabled_at IS 'When two-factor sign-in was turned on; empty = off.';
+COMMENT ON COLUMN user_accounts.mfa_last_step IS 'Last 30-second code step used, so a code can''t be used twice.';
 COMMENT ON TABLE user_sessions IS 'Signed-in sessions. The browser holds the token in an HttpOnly cookie; only its hash is stored.';
 COMMENT ON COLUMN user_sessions.token_hash IS 'SHA-256 of the session token.';
 COMMENT ON COLUMN user_sessions.account_id IS 'Who is signed in.';
@@ -1101,6 +1178,13 @@ COMMENT ON COLUMN user_sessions.created_at IS 'Sign-in time.';
 COMMENT ON COLUMN user_sessions.last_seen_at IS 'Last request; idle sessions expire.';
 COMMENT ON COLUMN user_sessions.expires_at IS 'Hard expiry.';
 COMMENT ON COLUMN user_sessions.user_agent IS 'Browser, for the sign-in log.';
+COMMENT ON COLUMN user_sessions.mfa_pending IS 'Password was right but the two-factor code isn''t entered yet: this session can only enter the code.';
+COMMENT ON TABLE mfa_backup_codes IS 'One-time backup codes for two-factor sign-in, for when the phone is lost. Only hashes are stored.';
+COMMENT ON COLUMN mfa_backup_codes.id IS 'Primary key.';
+COMMENT ON COLUMN mfa_backup_codes.account_id IS 'Whose code.';
+COMMENT ON COLUMN mfa_backup_codes.code_hash IS 'Argon2 hash of the code; never the code.';
+COMMENT ON COLUMN mfa_backup_codes.used_at IS 'When it was used; each code works once.';
+COMMENT ON COLUMN mfa_backup_codes.created_at IS 'When the row was created.';
 COMMENT ON TABLE approval_workflows IS 'How each kind of request gets approved.';
 COMMENT ON COLUMN approval_workflows.request_kind IS 'Kind of request.';
 COMMENT ON COLUMN approval_workflows.remind_after_days IS 'Remind the approver after this many days (0 = never).';
@@ -1158,6 +1242,8 @@ ALTER TABLE reimbursement_claims ADD CHECK (amount > 0 AND amount <= 50000);
 ALTER TABLE reimbursement_claims ADD CHECK (category <> 'Other' OR other_type IS NOT NULL);
 ALTER TABLE approval_workflow_steps ADD CHECK (approver_kind <> 'role' OR role_id IS NOT NULL);
 ALTER TABLE contribution_rate_versions ADD UNIQUE (agency, effective_from);
+ALTER TABLE subscriptions ADD CHECK (seat_limit IS NULL OR seat_limit > 0);
+ALTER TABLE subscriptions ADD CHECK (price_per_seat IS NULL OR price_per_seat >= 0);
 
 -- New Employees Template rules (BRD v1.1, 11.2.1)
 ALTER TABLE employees ADD CONSTRAINT employees_names_letters CHECK (last_name ~ $re$^[[:alpha:] .'-]+$$re$ AND first_name ~ $re$^[[:alpha:] .'-]+$$re$ AND (middle_name IS NULL OR middle_name ~ $re$^[[:alpha:] .'-]+$$re$));
@@ -1181,6 +1267,7 @@ ALTER TABLE payroll_adjustments ADD FOREIGN KEY (payroll_run_id, employee_id) RE
 
 -- Foreign keys (added after every table exists, since some point both ways)
 ALTER TABLE company_settings ADD CONSTRAINT company_settings_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE company_settings ADD CONSTRAINT company_settings_logo_file_id_fkey FOREIGN KEY (logo_file_id) REFERENCES files (id) ON DELETE SET NULL;
 ALTER TABLE org_units ADD CONSTRAINT org_units_parent_id_fkey FOREIGN KEY (parent_id) REFERENCES org_units (id) ON DELETE SET NULL;
 ALTER TABLE org_units ADD CONSTRAINT org_units_head_employee_id_fkey FOREIGN KEY (head_employee_id) REFERENCES employees (employee_id) ON DELETE SET NULL ON UPDATE CASCADE;
 ALTER TABLE positions ADD CONSTRAINT positions_department_id_fkey FOREIGN KEY (department_id) REFERENCES org_units (id) ON DELETE RESTRICT;
@@ -1247,10 +1334,13 @@ ALTER TABLE payroll_adjustments ADD CONSTRAINT payroll_adjustments_reimbursement
 ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_receipt_file_id_fkey FOREIGN KEY (receipt_file_id) REFERENCES files (id) ON DELETE RESTRICT;
 ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
-ALTER TABLE role_module_access ADD CONSTRAINT role_module_access_role_id_fkey FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE CASCADE;
+ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_approver_decided_by_fkey FOREIGN KEY (approver_decided_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_created_by_fkey FOREIGN KEY (created_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE user_accounts ADD CONSTRAINT user_accounts_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE SET NULL ON UPDATE CASCADE;
 ALTER TABLE user_accounts ADD CONSTRAINT user_accounts_role_id_fkey FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE RESTRICT;
 ALTER TABLE user_sessions ADD CONSTRAINT user_sessions_account_id_fkey FOREIGN KEY (account_id) REFERENCES user_accounts (id) ON DELETE CASCADE;
+ALTER TABLE mfa_backup_codes ADD CONSTRAINT mfa_backup_codes_account_id_fkey FOREIGN KEY (account_id) REFERENCES user_accounts (id) ON DELETE CASCADE;
 ALTER TABLE approval_workflow_steps ADD CONSTRAINT approval_workflow_steps_request_kind_fkey FOREIGN KEY (request_kind) REFERENCES approval_workflows (request_kind) ON DELETE CASCADE;
 ALTER TABLE approval_workflow_steps ADD CONSTRAINT approval_workflow_steps_role_id_fkey FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE SET NULL;
 ALTER TABLE audit_log ADD CONSTRAINT audit_log_actor_account_id_fkey FOREIGN KEY (actor_account_id) REFERENCES user_accounts (id) ON DELETE SET NULL;
@@ -1272,6 +1362,7 @@ CREATE INDEX ON audit_log (actor_account_id);
 CREATE INDEX ON audit_log (employee_id);
 CREATE INDEX ON certificate_requests (employee_id);
 CREATE INDEX ON company_assets (assigned_employee_id);
+CREATE INDEX ON company_settings (logo_file_id);
 CREATE INDEX ON company_settings (updated_by);
 CREATE INDEX ON compliance_filings (filed_by);
 CREATE INDEX ON contribution_rate_versions (saved_by);
@@ -1301,6 +1392,7 @@ CREATE INDEX ON leave_requests (decided_by);
 CREATE INDEX ON leave_requests (employee_id);
 CREATE INDEX ON leave_requests (filed_by);
 CREATE INDEX ON leave_requests (leave_type_id);
+CREATE INDEX ON mfa_backup_codes (account_id);
 CREATE INDEX ON offboarding_cases (employee_id);
 CREATE INDEX ON org_units (head_employee_id);
 CREATE INDEX ON org_units (parent_id);
@@ -1323,6 +1415,7 @@ CREATE INDEX ON punches (device_id);
 CREATE INDEX ON punches (employee_id);
 CREATE INDEX ON punches (recorded_by);
 CREATE INDEX ON punches (voided_by);
+CREATE INDEX ON reimbursement_claims (approver_decided_by);
 CREATE INDEX ON reimbursement_claims (decided_by);
 CREATE INDEX ON reimbursement_claims (employee_id);
 CREATE INDEX ON reimbursement_claims (receipt_file_id);
@@ -1330,6 +1423,8 @@ CREATE INDEX ON remote_work_day_branches (branch_id);
 CREATE INDEX ON remote_work_days (declared_by);
 CREATE INDEX ON schedule_overrides (set_by);
 CREATE INDEX ON schedule_overrides (shift_id);
+CREATE INDEX ON subscriptions (created_by);
+CREATE INDEX ON subscriptions (updated_by);
 CREATE INDEX ON time_requests (decided_by);
 CREATE INDEX ON time_requests (employee_id);
 CREATE INDEX ON training_records (employee_id);
@@ -1341,5 +1436,5 @@ CREATE INDEX ON leave_requests (employee_id, date_from, date_to);
 CREATE INDEX ON audit_log (employee_id, occurred_at DESC);
 CREATE INDEX ON employee_documents (expires_on) WHERE expires_on IS NOT NULL;
 
-INSERT INTO schema_migrations (version) VALUES ('001_leave'), ('002_timekeeping'), ('003_payroll'), ('004_files'), ('005_comments');
+INSERT INTO schema_migrations (version) VALUES ('001_leave'), ('002_timekeeping'), ('003_payroll'), ('004_files'), ('005_comments'), ('006_roles_settings'), ('007_subscriptions'), ('008_audit_append_only'), ('009_encrypt_government_numbers'), ('010_encrypt_document_numbers'), ('011_encrypt_files_and_reasons'), ('012_encrypt_file_names'), ('013_mfa');
 COMMIT;

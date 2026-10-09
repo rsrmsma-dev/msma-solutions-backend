@@ -12,7 +12,26 @@ export interface LeaveData {
   adjustments: Adjustment[];
   /** Unused days brought over from last year, by "employeeId|typeId". */
   carryOver: Record<string, number>;
+  /** Company-wide defaults from Settings > Time off & leave. */
+  policy?: Partial<LeavePolicy>;
+  /** Working days from Settings > Organization, 0 = Sunday … 6 = Saturday (default Monday–Friday). */
+  workWeek?: number[];
 }
+
+export interface LeavePolicy {
+  /** Off: filing is whole days only. */
+  allowHalfDays: boolean;
+  /** On: people can file beyond their remaining credits. */
+  allowNegative: boolean;
+  /** Carry-over limit pre-filled for new leave types. */
+  defaultCarryOver: number;
+  /** TODO: credits are granted yearly today; monthly and per-payroll accrual aren't calculated yet. */
+  accrual: "yearly" | "monthly" | "per-payroll";
+}
+
+export const DEFAULT_LEAVE_POLICY: LeavePolicy = { allowHalfDays: true, allowNegative: false, defaultCarryOver: 0, accrual: "yearly" };
+export const DEFAULT_WORK_WEEK = [1, 2, 3, 4, 5];
+export const policyOf = (data: Pick<LeaveData, "policy">): LeavePolicy => ({ ...DEFAULT_LEAVE_POLICY, ...data.policy });
 
 /** What the rules need to know about the person: sex and civil status for eligibility, hire date for accrual and service length. */
 export interface LeavePersonFacts {
@@ -49,13 +68,14 @@ export function addDays(date: string, n: number) {
 const weekday = (date: string) => new Date(`${date}T12:00:00`).getDay();
 const isHoliday = (date: string) => HOLIDAYS.some((h) => h.date === date);
 
-/** Days a request covers: working days (Mon–Fri, not holidays) or every calendar day. */
-export function countDays(start: string, end: string, countBy: LeaveType["countBy"], halfDay?: "am" | "pm") {
+/** Days a request covers: working days (the company's work week, not holidays) or every calendar day. */
+export function countDays(start: string, end: string, countBy: LeaveType["countBy"], halfDay?: "am" | "pm", workWeek: number[] = DEFAULT_WORK_WEEK) {
   if (!start || !end || end < start) return 0;
-  if (halfDay && start === end) return countBy === "calendar" || (weekday(start) !== 0 && weekday(start) !== 6 && !isHoliday(start)) ? 0.5 : 0;
+  const isWorkday = (date: string) => workWeek.includes(weekday(date));
+  if (halfDay && start === end) return countBy === "calendar" || (isWorkday(start) && !isHoliday(start)) ? 0.5 : 0;
   let n = 0;
   for (let d = start; d <= end; d = addDays(d, 1)) {
-    if (countBy === "calendar" || (weekday(d) !== 0 && weekday(d) !== 6 && !isHoliday(d))) n++;
+    if (countBy === "calendar" || (isWorkday(d) && !isHoliday(d))) n++;
   }
   return n;
 }
@@ -181,7 +201,10 @@ export function previewOf(data: LeaveData, person: LeavePersonFacts | undefined,
   if (!type) return { days: 0, errors: [...errors, "Choose the leave type"], notes };
   if (!input.start || !input.end) return { days: 0, errors: [...errors, "Pick the start and end dates"], notes };
   if (input.end < input.start) return { days: 0, errors: [...errors, "The end date is before the start date"], notes };
-  const days = countDays(input.start, input.end, type.countBy, input.start === input.end ? input.halfDay : undefined);
+  // Half days only when Settings > Time off & leave allows them.
+  const policy = policyOf(data);
+  const halfDay = input.start === input.end && policy.allowHalfDays ? input.halfDay : undefined;
+  const days = countDays(input.start, input.end, type.countBy, halfDay, data.workWeek);
   if (days === 0) errors.push("Those dates are all weekends or holidays, so no leave is needed");
   const holidays = HOLIDAYS.filter((h) => h.date >= input.start && h.date <= input.end);
   if (holidays.length && type.countBy === "workdays") notes.push(`${holidays.map((h) => h.name).join(", ")} ${holidays.length === 1 ? "is a holiday" : "are holidays"}, not counted.`);
@@ -190,7 +213,7 @@ export function previewOf(data: LeaveData, person: LeavePersonFacts | undefined,
   if (!balance.eligible) errors.push(balance.eligibilityNote ?? "This employee can't use this leave type");
   else if (balance.eligibilityNote) notes.push(balance.eligibilityNote);
   const credits = balance.unlimited ? undefined : creditsOf(data, input.employeeId);
-  if (credits && credits.available < 1) errors.push(`All ${credits.total} leaves for this year are used up. File it as Leave without pay.`);
+  if (credits && credits.available < 1 && !policy.allowNegative) errors.push(`All ${credits.total} leaves for this year are used up. File it as Leave without pay.`);
   if (type.attachmentOver !== null && days > type.attachmentOver && !input.attachment) errors.push(type.attachmentOver === 0 ? `${type.name} needs a supporting document` : `${type.name} over ${type.attachmentOver} days needs a supporting document (e.g. medical certificate)`);
   const overlap = data.requests.find((r) => r.id !== ignoreId && r.employeeId === input.employeeId && (r.status === "pending" || r.status === "approved") && r.start <= input.end && r.end >= input.start);
   if (overlap) errors.push(`Overlaps another ${overlap.status} request (${overlap.start === overlap.end ? overlap.start : `${overlap.start} to ${overlap.end}`})`);

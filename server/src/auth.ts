@@ -1,26 +1,27 @@
-// Sign-in, sessions and module access.
+// Sign-in, sessions and access. What each role may do is the team's access matrix in
+// src/lib/permissions.ts, the same table the website's pages and buttons read.
 
 import { createHash, randomBytes } from "node:crypto";
 import { hash, verify } from "@node-rs/argon2";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { pool, UserError, type Db } from "./db.js";
+import { can as allowed, canFor, scopeFor, visible, type Action, type Feature, type RoleKey, type Scope, type Who } from "../../src/lib/permissions";
 
 export const COOKIE = "heyhr_session";
 const MAX_SESSION_HOURS = 12;
-
-export type ModuleKey = "people" | "company" | "documents" | "timekeeping" | "leave" | "reimbursements" | "reports" | "payroll" | "administration";
-export type Access = "none" | "view" | "edit" | "approve";
-const RANK: Record<Access, number> = { none: 0, view: 1, edit: 2, approve: 3 };
 
 export interface Session {
   accountId: string;
   name: string;
   username: string;
   roleId: string;
+  /** Which of the six roles (src/lib/permissions.ts). */
+  role: RoleKey | null;
   workspace: "employee" | "manager" | "admin";
   /** EMPLOYEE_ID of the linked employee, if any. */
   employeeNo?: string;
-  access: Record<ModuleKey, Access>;
+  /** EMPLOYEE_IDs of their direct reports (active), for "team" access. */
+  team: string[];
   /** Signed in with a temporary password: only changing it is allowed. */
   mustChangePassword: boolean;
 }
@@ -32,7 +33,13 @@ declare module "fastify" {
 }
 
 export const hashPassword = (p: string) => hash(p, { memoryCost: 19456, timeCost: 2, parallelism: 1 });
+/** Checked against when the username doesn't exist (see signIn). */
+const DUMMY_HASH = hashPassword(randomBytes(16).toString("hex"));
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+/** How a session token is stored (only its hash). */
+export const sessionHash = sha256;
+/** A sign-in waiting for its two-factor code may only enter the code, for this long. */
+const MFA_WAIT_MINUTES = 5;
 
 export async function audit(db: Db, e: { actorId?: string; actorName: string; module: string; action: string; target: string; employeeNo?: string; detail?: string }) {
   await db.query(
@@ -42,12 +49,16 @@ export async function audit(db: Db, e: { actorId?: string; actorName: string; mo
   );
 }
 
-/** The account in the shape the frontend's Administration store uses. */
+/**
+ * The account in the shape the frontend's Administration store uses. Every account here is a real
+ * one, so no "demo" key is sent (the website would otherwise treat it as a demo login).
+ */
 export async function accountJson(db: Db, id: string) {
   const { rows } = await db.query(
-    `select a.id, a.display_name as name, a.username, a.builtin_key as demo, a.employee_id as "employeeId", a.role_id as "roleId",
+    `select a.id, a.display_name as name, a.username, a.employee_id as "employeeId", a.role_id as "roleId",
             a.status, a.must_change_password as "mustChangePassword", a.last_sign_in_at as "lastSignIn",
-            a.failed_attempts as "failedAttempts", a.locked_until as "lockedUntil", a.created_at as "createdAt", r.workspace
+            a.failed_attempts as "failedAttempts", a.locked_until as "lockedUntil", a.created_at as "createdAt", r.workspace,
+            (a.mfa_enabled_at is not null) as "mfaEnabled"
        from user_accounts a join roles r on r.id = a.role_id
       where a.id = $1`,
     [id],
@@ -77,7 +88,11 @@ export async function signIn(username: string, password: string, userAgent: stri
     await audit(pool, { actorId: a?.id, actorName: a?.display_name ?? (u || "(blank)"), module: "Sign-in", action: "Failed sign-in", target: u || "(blank)", detail });
     throw new UserError(error, 401);
   };
-  if (!a) return failed("Incorrect username or password.", "Unknown username");
+  // An unknown username takes as long as a wrong password, so timing doesn't reveal which usernames exist.
+  if (!a) {
+    await verify(await DUMMY_HASH, password).catch(() => false);
+    return failed("Incorrect username or password.", "Unknown username");
+  }
   if (a.locked_until && new Date(a.locked_until) > now) {
     const mins = Math.ceil((new Date(a.locked_until).getTime() - now.getTime()) / 60000);
     return failed(`Too many wrong passwords. Try again in ${mins} minute${mins === 1 ? "" : "s"}, or ask HR to unlock your account.`, "Account locked");
@@ -98,8 +113,16 @@ export async function signIn(username: string, password: string, userAgent: stri
   if (a.status === "disabled") return failed("This account has been turned off. Please contact HR.", "Account turned off");
   if (!a.role_ok) return failed("This account has no role yet. Please contact HR.", "No role");
 
-  await pool.query(`update user_accounts set failed_attempts = 0, locked_until = null, last_sign_in_at = now() where id = $1`, [a.id]);
   const token = randomBytes(32).toString("base64url");
+  // Two-factor sign-in: the password was right, but the session can only enter the code until it is.
+  if (a.mfa_enabled_at) {
+    await pool.query(`insert into user_sessions (token_hash, account_id, expires_at, user_agent, mfa_pending) values ($1, $2, now() + make_interval(mins => $3), $4, true)`, [
+      sha256(token), a.id, MFA_WAIT_MINUTES, userAgent?.slice(0, 300) ?? null,
+    ]);
+    await audit(pool, { actorId: a.id, actorName: a.display_name, module: "Sign-in", action: "Password accepted", target: a.username, detail: "Waiting for the two-factor code" });
+    return { token, mfaRequired: true as const };
+  }
+  await pool.query(`update user_accounts set failed_attempts = 0, locked_until = null, last_sign_in_at = now() where id = $1`, [a.id]);
   await pool.query(`insert into user_sessions (token_hash, account_id, expires_at, user_agent) values ($1, $2, now() + make_interval(hours => $3), $4)`, [
     sha256(token),
     a.id,
@@ -128,22 +151,21 @@ export async function loadSession(req: FastifyRequest): Promise<Session | undefi
   const { rows } = await pool.query(
     `update user_sessions s set last_seen_at = now()
        from user_accounts a join roles r on r.id = a.role_id
-      where s.token_hash = $1 and a.id = s.account_id and a.status = 'active'
+      where s.token_hash = $1 and a.id = s.account_id and a.status = 'active' and not s.mfa_pending
         and s.expires_at > now() and s.last_seen_at > now() - make_interval(mins => $2)
-      returning a.id, a.display_name, a.username, a.role_id, r.workspace, a.employee_id, a.must_change_password`,
+      returning a.id, a.display_name, a.username, a.role_id, r.role_key, r.workspace, a.employee_id, a.must_change_password`,
     [sha256(token), idle_minutes],
   );
   const r = rows[0];
   if (!r) {
-    await pool.query(`delete from user_sessions where token_hash = $1`, [sha256(token)]);
+    // Ended, idle or expired: removed. A sign-in still waiting for its two-factor code stays until it expires.
+    await pool.query(`delete from user_sessions where token_hash = $1 and (not mfa_pending or expires_at <= now())`, [sha256(token)]);
     return undefined;
   }
-  const access = Object.fromEntries(
-    ["people", "company", "documents", "timekeeping", "leave", "reimbursements", "reports", "payroll", "administration"].map((m) => [m, "none"]),
-  ) as Record<ModuleKey, Access>;
-  const acc = await pool.query(`select module, access from role_module_access where role_id = $1`, [r.role_id]);
-  for (const x of acc.rows) access[x.module as ModuleKey] = x.access;
-  return { accountId: r.id, name: r.display_name, username: r.username, roleId: r.role_id, workspace: r.workspace, employeeNo: r.employee_id ?? undefined, access, mustChangePassword: r.must_change_password };
+  const team = r.employee_id
+    ? (await pool.query(`select employee_id from employees where supervisor_id = $1 and record_status <> 'SEPARATED'`, [r.employee_id])).rows.map((x) => x.employee_id as string)
+    : [];
+  return { accountId: r.id, name: r.display_name, username: r.username, roleId: r.role_id, role: r.role_key ?? null, workspace: r.workspace, employeeNo: r.employee_id ?? undefined, team, mustChangePassword: r.must_change_password };
 }
 
 /** Fastify preHandler: 401 unless signed in. */
@@ -153,10 +175,29 @@ export async function requireSession(req: FastifyRequest, reply: FastifyReply) {
   // The website has no "set a new password" screen, so a temporary password isn't forced to change here.
 }
 
-export function can(s: Session, module: ModuleKey, needed: Access) {
-  return RANK[s.access[module]] >= RANK[needed];
+/** The signed-in person as the access matrix sees them. */
+export const whoOf = (s: Session): Who => ({ role: s.role, employeeId: s.employeeNo, team: s.team });
+
+/** May they do this (at all, or to this employee's record when one is given)? */
+export function can(s: Session, action: Action, feature: Feature, employeeNo?: string) {
+  return employeeNo === undefined ? allowed(whoOf(s), action, feature) : canFor(whoOf(s), action, feature, employeeNo);
 }
 
-export function demand(s: Session, module: ModuleKey, needed: Access) {
-  if (!can(s, module, needed)) throw new UserError("You don't have access to do that.", 403);
+export function demand(s: Session, action: Action, feature: Feature, employeeNo?: string) {
+  if (!can(s, action, feature, employeeNo)) throw new UserError("You don't have access to do that.", 403);
+}
+
+/** Everyone, their team, only themselves, or null for no access. */
+export const scopeOf = (s: Session, action: Action, feature: Feature): Scope | null => scopeFor(whoOf(s), action, feature);
+
+/** The rows they may see, by the employee each row belongs to. */
+export const seen = <T,>(s: Session, feature: Feature, rows: T[], employeeOf: (r: T) => string | undefined): T[] => visible(whoOf(s), feature, rows, employeeOf);
+
+/** EMPLOYEE_IDs whose records they may see for this feature, or "all". */
+export function seenIds(s: Session, feature: Feature, action: Action = "view"): "all" | string[] {
+  const sc = scopeOf(s, action, feature);
+  if (sc === "all") return "all";
+  if (sc === "team") return s.team;
+  if (sc === "own") return s.employeeNo ? [s.employeeNo] : [];
+  return [];
 }

@@ -42,14 +42,22 @@ $bytes = New-Object byte[] 32
 $appPassword = -join ($bytes | ForEach-Object { $chars[$_ % $chars.Length] })
 Run-Sql "postgres" "DO `$`$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'heyhr_app') THEN CREATE ROLE heyhr_app LOGIN; END IF; END `$`$"
 Run-Sql "postgres" "ALTER ROLE heyhr_app WITH LOGIN PASSWORD '$appPassword'"
-Run-Sql "heyhr" "GRANT CONNECT ON DATABASE heyhr TO heyhr_app; GRANT USAGE ON SCHEMA public TO heyhr_app; GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO heyhr_app; GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO heyhr_app"
+Run-Sql "heyhr" "GRANT CONNECT ON DATABASE heyhr TO heyhr_app; GRANT USAGE ON SCHEMA public TO heyhr_app; GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO heyhr_app; GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO heyhr_app; REVOKE UPDATE, DELETE, TRUNCATE ON audit_log FROM heyhr_app"
+
+# The key that encrypts employees' government numbers (server/src/crypto.ts). Keep a copy somewhere
+# safe and separate from the backups: without it those numbers can't be read back.
+$keyBytes = New-Object byte[] 32
+[Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($keyBytes)
+$dataKey = [Convert]::ToBase64String($keyBytes)
 
 $envFile = Join-Path $PSScriptRoot ".env"
 @(
   "# Written by setup-db.ps1. Keep this file private; git ignores it.",
   "DATABASE_URL=postgres://heyhr_app:$appPassword@localhost:5432/heyhr",
-  "PORT=3001"
+  "PORT=3001",
+  "HEYHR_DATA_KEY=$dataKey"
 ) | Set-Content -Path $envFile -Encoding ascii
+$dataKey = $null
 Remove-Item Env:PGPASSWORD
 $appPassword = $null
 

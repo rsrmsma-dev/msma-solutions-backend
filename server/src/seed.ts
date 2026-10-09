@@ -1,6 +1,6 @@
 // Loads the starting setup into an empty database: company settings, the org
-// structure and positions, roles and their access, and the four built-in
-// sign-ins. No employees. Safe to re-run: it skips anything already there.
+// structure and positions, the six roles, and a starting sign-in for each role.
+// No employees. Safe to re-run: it skips anything already there.
 //
 // Built-in passwords match src/lib/credentials.ts. Change them after first sign-in.
 
@@ -10,6 +10,7 @@ import { seedTypes } from "./leave.js";
 import { seedShifts } from "./timekeeping.js";
 import { seedRates } from "./payroll.js";
 import { seedWorkflows } from "./admin.js";
+import { LIMITS, ROLE_DESCRIPTION, ROLE_LABEL, type RoleKey } from "../../src/lib/permissions";
 
 const BRANCHES = [
   { name: "Cebu HQ", code: "CEB", address: "8F Park Centrale Tower, Cebu IT Park, Lahug, Cebu City" },
@@ -34,29 +35,26 @@ const ORG_SEED: [string, string, string, string][] = [
 const levelFor = (t: string) => (/^partner$/i.test(t) ? "Executive" : /director/i.test(t) ? "Manager" : /lead|supervisor/i.test(t) ? "Supervisor" : "Rank and file");
 const acronym = (t: string) => t.split(/\s+/).map((w) => w[0]).join("").toUpperCase();
 
-const MODULES = ["people", "company", "documents", "timekeeping", "leave", "reimbursements", "reports", "payroll", "administration"] as const;
-type Access = "none" | "view" | "edit" | "approve";
-const all = (a: Access) => Object.fromEntries(MODULES.map((m) => [m, a])) as Record<(typeof MODULES)[number], Access>;
-// Same as DEFAULT_ROLES in src/lib/admin/store.ts.
-const ROLES = [
-  { id: "super-admin", name: "Super Admin", description: "Runs the system and payroll: users, roles, approval workflows, audit trail, settings, payroll and government contributions.", workspace: "admin", superAdmin: true, access: { ...all("none"), payroll: "edit", administration: "edit" } },
-  { id: "admin", name: "Admin", description: "Runs HR: every HR module, company setup and approvals.", workspace: "admin", access: { ...all("edit"), timekeeping: "approve", leave: "approve", reimbursements: "approve", administration: "none", payroll: "none" } },
-  { id: "hr", name: "HR", description: "Day-to-day HR: employee records, attendance, leave and reports. Approves leave, overtime and undertime.", workspace: "admin", access: { people: "edit", company: "view", documents: "edit", timekeeping: "approve", leave: "approve", reimbursements: "approve", reports: "view", payroll: "view", administration: "none" } },
-  { id: "employee", name: "Employee", description: "Self-service: own leave, time, payslips and 201 file.", workspace: "employee", access: all("none") },
-];
+// The six fixed roles (src/lib/admin/store.ts DEFAULT_ROLES; names and descriptions from src/lib/permissions.ts).
+const ROLES = (["system_admin", "super_admin", "hr", "approver", "accounting", "employee"] as RoleKey[]).map((key) => ({
+  id: key.replace("_", "-"), key, name: ROLE_LABEL[key], description: ROLE_DESCRIPTION[key], workspace: LIMITS.workspace[key],
+}));
+/** Starting sign-ins, one per role. `key` marks the ones created at setup before the six roles. Change the passwords after first sign-in. */
 const ACCOUNTS = [
   { key: "superadmin", username: "superadmin", password: "Heyhr-Super-2026!", name: "System Administrator", role: "super-admin" },
-  { key: "admin", username: "admin", password: "Heyhr-Admin-2026!", name: "Office Administrator", role: "admin" },
-  { key: "hr", username: "admin1", password: "Heyhr-HR-2026!", name: "Dinah Marquez", role: "hr" },
-  { key: "employee", username: "admin2", password: "Heyhr-Staff-2026!", name: "Employee (demo)", role: "employee" },
+  { key: "admin", username: "admin", password: "Heyhr-Admin-2026!", name: "Office Administrator", role: "hr" },
+  { key: "hr", username: "admin1", password: "Heyhr-HR-2026!", name: "HR", role: "hr" },
+  { key: "employee", username: "admin2", password: "Heyhr-Staff-2026!", name: "Employee", role: "employee" },
+  { key: null, username: "sysadmin", password: "Heyhr-SysAdmin-2026!", name: "System Admin", role: "system-admin" },
+  { key: null, username: "approver", password: "Heyhr-Approver-2026!", name: "Approver", role: "approver" },
+  { key: null, username: "accounting", password: "Heyhr-Accounting-2026!", name: "Accounting", role: "accounting" },
 ];
 
 await tx(async (c) => {
   await c.query(`insert into company_settings (id, company_name, address, contact_email) values (1, 'MSMA Group', 'Cebu City, Cebu', 'hr@msma.ph') on conflict do nothing`);
 
   for (const r of ROLES) {
-    await c.query(`insert into roles (id, name, description, workspace, is_built_in, is_super_admin) values ($1,$2,$3,$4,true,$5) on conflict do nothing`, [r.id, r.name, r.description, r.workspace, !!r.superAdmin]);
-    for (const [m, a] of Object.entries(r.access)) await c.query(`insert into role_module_access (role_id, module, access) values ($1,$2,$3) on conflict do nothing`, [r.id, m, a]);
+    await c.query(`insert into roles (id, role_key, name, description, workspace, is_built_in, is_super_admin) values ($1,$2,$3,$4,$5,true,$6) on conflict do nothing`, [r.id, r.key, r.name, r.description, r.workspace, r.key === "super_admin"]);
   }
   await seedTypes(c);
   await seedShifts(c);
@@ -64,7 +62,7 @@ await tx(async (c) => {
   await seedWorkflows(c);
 
   for (const a of ACCOUNTS) {
-    const exists = await c.query(`select 1 from user_accounts where builtin_key = $1`, [a.key]);
+    const exists = await c.query(`select 1 from user_accounts where builtin_key = $1 or lower(username) = $2`, [a.key, a.username]);
     if (!exists.rowCount) await c.query(`insert into user_accounts (username, builtin_key, display_name, password_hash, role_id) values ($1,$2,$3,$4,$5)`, [a.username, a.key, a.name, await hashPassword(a.password), a.role]);
   }
 

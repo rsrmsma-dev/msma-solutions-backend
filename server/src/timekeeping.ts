@@ -10,7 +10,7 @@
 import type pg from "pg";
 import { DEFAULT_SHIFTS, shiftProblem, tardinessRuleProblem } from "../../src/lib/timekeeping/rules";
 import type { ShiftTemplate } from "../../src/lib/timekeeping/types";
-import { can, demand, type Session } from "./auth";
+import { demand, seenIds, type Session } from "./auth";
 import { clean, pool, tx, UserError, type Db } from "./db";
 
 const TZ = process.env.APP_TIME_ZONE ?? "Asia/Manila";
@@ -91,24 +91,29 @@ const noticeJson = (n: any) => clean({
   sentBy: n.sent_by_name, sentAt: iso(n.sent_at), acknowledgedAt: iso(n.acknowledged_at),
 });
 
-/** Everything the Timekeeping pages read, in the browser's shapes. Without Timekeeping access, only your own records. */
+/**
+ * Everything the Timekeeping pages read, in the browser's shapes: everyone's records for roles that
+ * see all attendance (HR, Accounting for payroll, Super Admin), an approver's team, or only your own.
+ */
 export async function loadState(s: Session) {
-  // Payroll works out pay from everyone's attendance, so it reads it all too.
-  const all = can(s, "timekeeping", "view") || can(s, "payroll", "view");
-  const me = s.employeeNo ?? "";
-  // Without Timekeeping access, person-specific rows are limited to the signed-in employee (as a query parameter).
+  const scope = seenIds(s, "attendanceRecords");
+  const all = scope === "all";
+  const ids = all ? [] : [...new Set([...scope, ...(s.employeeNo ? [s.employeeNo] : [])])];
+  // Person-specific rows are limited to those people (as a query parameter).
   const own = (base: string, order = "") =>
-    all ? pool.query(`${base} ${order}`) : pool.query(`${base} ${base.includes(" where ") ? "and" : "where"} employee_id = $1 ${order}`, [me]);
+    all ? pool.query(`${base} ${order}`) : pool.query(`${base} ${base.includes(" where ") ? "and" : "where"} employee_id = any($1) ${order}`, [ids]);
   const [shifts, usual, overrides, punches, requests, fixes, auditRows, settings, notices, remote] = await Promise.all([
     pool.query(`select * from shift_templates order by name`),
     own(`select employee_id, default_shift_id from employees where default_shift_id is not null`),
     own(`select * from schedule_overrides`),
-    pool.query(all ? PUNCH_SELECT : `${PUNCH_SELECT} where employee_id = $2`, all ? [TZ] : [TZ, me]),
+    pool.query(all ? PUNCH_SELECT : `${PUNCH_SELECT} where employee_id = any($2)`, all ? [TZ] : [TZ, ids]),
     own(`select * from time_requests`, `order by work_date desc`),
     own(`select * from punch_fix_requests`, `order by filed_at desc`),
-    all
-      ? pool.query(`select id::text, employee_id, data->>'workDate' as work_date, actor_name, action, coalesce(detail, '') as detail, occurred_at from audit_log where module = 'Timekeeping' and employee_id is not null order by occurred_at desc limit 5000`)
-      : { rows: [] as any[] },
+    pool.query(
+      `select id::text, employee_id, data->>'workDate' as work_date, actor_name, action, coalesce(detail, '') as detail, occurred_at from audit_log
+        where module = 'Timekeeping' and employee_id is not null ${all ? "" : "and employee_id = any($1)"} order by occurred_at desc limit 5000`,
+      all ? [] : [scope],
+    ),
     pool.query(`select tardy_consecutive_days, tardy_per_month from company_settings where id = 1`),
     own(`select * from attendance_notices`, `order by sent_at desc`),
     pool.query(`select d.*, coalesce(array_agg(u.name order by u.name) filter (where u.name is not null), '{}') as offices
@@ -158,7 +163,7 @@ async function insertCorrection(c: Db, s: Session, input: { employeeId: string; 
 }
 
 export async function addCorrection(s: Session, input: any) {
-  demand(s, "timekeeping", "edit");
+  demand(s, "edit", "attendanceRecords", String(input?.employeeId ?? ""));
   return tx((c) => insertCorrection(c, s, { ...input, employeeId: String(input?.employeeId ?? ""), workDate: String(input?.workDate ?? ""), kind: String(input?.kind ?? ""), time: String(input?.time ?? ""), nextDay: !!input?.nextDay, reason: String(input?.reason ?? "") }));
 }
 
@@ -174,24 +179,27 @@ async function setAside(c: Db, s: Session, p: any, reason: string) {
 }
 
 export async function setPunchAside(s: Session, id: string, reason: string) {
-  demand(s, "timekeeping", "edit");
   if (!reason.trim()) throw new UserError("Say why this punch should be ignored");
-  return tx(async (c) => setAside(c, s, await punchRow(c, id), reason.trim()));
+  return tx(async (c) => {
+    const p = await punchRow(c, id);
+    demand(s, "edit", "attendanceRecords", p.employee_id);
+    await setAside(c, s, p, reason.trim());
+  });
 }
 
 export async function keepPunch(s: Session, id: string) {
-  demand(s, "timekeeping", "edit");
   return tx(async (c) => {
     const p = await punchRow(c, id);
+    demand(s, "edit", "attendanceRecords", p.employee_id);
     await c.query(`update punches set confirmed_by = $2, confirmed_by_name = $3, confirmed_at = now() where id = $1`, [p.id, s.accountId, s.name]);
     await log(c, s, p.employee_id, p.work_date, "Kept flagged punch", `Time-${p.direction} ${p.at_local.slice(11)} (${p.device_label ?? ""}${p.face_match !== null ? `, ${p.face_match}% match` : ""})`);
   });
 }
 
 export async function restorePunch(s: Session, id: string) {
-  demand(s, "timekeeping", "edit");
   return tx(async (c) => {
     const p = await punchRow(c, id);
+    demand(s, "edit", "attendanceRecords", p.employee_id);
     await c.query(`update punches set voided_reason = null, voided_by = null, voided_by_name = null, voided_at = null where id = $1`, [p.id]);
     await log(c, s, p.employee_id, p.work_date, "Restored punch", `Time-${p.direction} ${p.at_local.slice(11)}`);
   });
@@ -200,7 +208,7 @@ export async function restorePunch(s: Session, id: string) {
 // ---- Shifts and schedules ----
 
 export async function saveShift(s: Session, body: any) {
-  demand(s, "timekeeping", "edit");
+  demand(s, body?.id ? "edit" : "create", "attendanceSettings");
   const input = {
     id: body?.id ? String(body.id) : undefined,
     name: String(body?.name ?? ""), start: String(body?.start ?? ""), end: String(body?.end ?? ""),
@@ -226,7 +234,7 @@ export async function saveShift(s: Session, body: any) {
 }
 
 export async function setUsualShift(s: Session, employeeIds: unknown, shiftId: unknown) {
-  demand(s, "timekeeping", "edit");
+  demand(s, "edit", "attendanceSettings");
   const ids = Array.isArray(employeeIds) ? employeeIds.map(String) : [];
   if (!ids.length) throw new UserError("Choose who to change");
   return tx(async (c) => {
@@ -247,7 +255,7 @@ export async function setUsualShift(s: Session, employeeIds: unknown, shiftId: u
 
 /** One day only: a different shift, a rest day, or back to the usual schedule (null). */
 export async function setDayShift(s: Session, employeeId: string, date: string, value: string | null) {
-  demand(s, "timekeeping", "edit");
+  demand(s, "edit", "attendanceSettings");
   if (!DATE.test(date)) throw new UserError("Choose the day");
   return tx(async (c) => {
     await employee(c, employeeId);
@@ -277,7 +285,7 @@ export async function setDayShift(s: Session, employeeId: string, date: string, 
 
 export async function fileRequest(s: Session, body: any) {
   const input = { employeeId: String(body?.employeeId ?? ""), date: String(body?.date ?? ""), type: String(body?.type ?? ""), minutes: Number(body?.minutes), reason: String(body?.reason ?? "").trim() };
-  if (!(s.employeeNo && input.employeeId === s.employeeNo)) demand(s, "timekeeping", "edit");
+  demand(s, "create", "attendanceRecords", input.employeeId);
   if (input.type !== "overtime" && input.type !== "undertime") throw new UserError("Choose overtime or undertime");
   if (!DATE.test(input.date)) throw new UserError("Choose the day");
   if (!Number.isFinite(input.minutes) || input.minutes <= 0) throw new UserError("Enter how many minutes");
@@ -298,10 +306,10 @@ export async function fileRequest(s: Session, body: any) {
 }
 
 export async function decideRequest(s: Session, id: string, approve: boolean, note: string) {
-  demand(s, "timekeeping", "approve");
   return tx(async (c) => {
     const r = (await c.query(`select * from time_requests where id::text = $1 for update`, [id])).rows[0];
     if (!r) throw new UserError("That request no longer exists", 404);
+    demand(s, "approve", "attendanceRecords", r.employee_id);
     if (r.status !== "pending") throw new UserError("This request was already decided");
     if (!approve && !note.trim()) throw new UserError("Add a short note so the employee knows why");
     const { rows: [next] } = await c.query(
@@ -316,7 +324,7 @@ export async function decideRequest(s: Session, id: string, approve: boolean, no
 // ---- Tardiness rule ----
 
 export async function saveTardinessRule(s: Session, body: any) {
-  demand(s, "timekeeping", "edit");
+  demand(s, "edit", "rules");
   const rule = { consecutive: Number(body?.consecutive), perMonth: Number(body?.perMonth) };
   const problem = tardinessRuleProblem(rule);
   if (problem) throw new UserError(problem);
@@ -340,7 +348,7 @@ async function remoteDayFor(c: Db, employeeId: string, date: string) {
 }
 
 export async function declareRemoteDay(s: Session, body: any) {
-  demand(s, "timekeeping", "edit");
+  demand(s, "create", "remoteDays");
   const from = String(body?.from ?? ""), to = String(body?.to ?? ""), reason = String(body?.reason ?? "").trim();
   const offices: string[] = Array.isArray(body?.offices) ? body.offices.map(String) : [];
   if (!DATE.test(from) || !DATE.test(to)) throw new UserError("Choose the dates");
@@ -370,7 +378,7 @@ export async function declareRemoteDay(s: Session, body: any) {
 }
 
 export async function cancelRemoteDay(s: Session, id: string) {
-  demand(s, "timekeeping", "edit");
+  demand(s, "delete", "remoteDays");
   return tx(async (c) => {
     const d = (await c.query(`select * from remote_work_days where id::text = $1 for update`, [id])).rows[0];
     if (!d) throw new UserError("That remote work day no longer exists", 404);
@@ -410,8 +418,8 @@ export async function clockRemote(s: Session, kind: string, match: unknown) {
 // ---- Notices ----
 
 export async function sendNotice(s: Session, body: any) {
-  demand(s, "timekeeping", "edit");
   const employeeId = String(body?.employeeId ?? ""), kind = String(body?.kind ?? "");
+  demand(s, "edit", "attendanceRecords", employeeId);
   const subject = String(body?.subject ?? "").trim(), message = String(body?.message ?? "").trim();
   const dates: string[] = Array.isArray(body?.dates) ? body.dates.map(String).filter((d: string) => DATE.test(d)) : [];
   if (kind !== "tardiness" && kind !== "awol") throw new UserError("Choose the kind of notice");
@@ -456,7 +464,7 @@ export async function fileFix(s: Session, body: any) {
     employeeId: String(body?.employeeId ?? ""), workDate: String(body?.workDate ?? ""), kind: String(body?.kind ?? ""), time: String(body?.time ?? ""),
     nextDay: !!body?.nextDay, cause: CAUSES.includes(body?.cause) ? String(body.cause) : "not-recorded", reason: String(body?.reason ?? "").trim(),
   };
-  if (!(s.employeeNo && input.employeeId === s.employeeNo)) demand(s, "timekeeping", "edit");
+  demand(s, "create", "attendanceRecords", input.employeeId);
   if (input.kind !== "in" && input.kind !== "out") throw new UserError("Choose time-in or time-out");
   if (!DATE.test(input.workDate)) throw new UserError("Choose the day");
   if (!HHMM.test(input.time)) throw new UserError("Enter the correct time");
@@ -481,10 +489,10 @@ export async function fileFix(s: Session, body: any) {
 
 /** Approving adds the punch exactly as if HR had added it; a wrong device time is set aside first. */
 export async function decideFix(s: Session, id: string, approve: boolean, note: string) {
-  demand(s, "timekeeping", "approve");
   return tx(async (c: pg.PoolClient) => {
     const r = (await c.query(`select * from punch_fix_requests where id::text = $1 for update`, [id])).rows[0];
     if (!r) throw new UserError("That request no longer exists", 404);
+    demand(s, "approve", "attendanceRecords", r.employee_id);
     if (r.status !== "pending") throw new UserError("This request was already decided");
     if (!approve && !note.trim()) throw new UserError("Add a short note so the employee knows why");
     if (approve) {

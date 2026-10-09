@@ -41,7 +41,7 @@ export function claimProblems(input: ClaimInput, claims: Pick<Claim, "employeeId
   if (!input.description.trim()) errors.description = "Say what it was for";
   if (!errors.amount && !errors.purchaseDate) {
     const dup = claims.find(
-      (c) => c.employeeId === input.employeeId && (c.status === "pending" || c.status === "approved") && c.purchaseDate === input.purchaseDate && c.amount === Math.round(input.amount * 100) / 100 && c.merchant.trim().toLowerCase() === input.merchant.trim().toLowerCase(),
+      (c) => c.employeeId === input.employeeId && c.status !== "rejected" && c.purchaseDate === input.purchaseDate && c.amount === Math.round(input.amount * 100) / 100 && c.merchant.trim().toLowerCase() === input.merchant.trim().toLowerCase(),
     );
     if (dup) errors.receipt = "You've already claimed this receipt";
   }

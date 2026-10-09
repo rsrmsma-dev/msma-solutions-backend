@@ -1,6 +1,6 @@
 # HeyHR data dictionary
 
-PostgreSQL schema for the HRIS: 46 tables in 7 areas. The DDL is in [`schema.sql`](schema.sql).
+PostgreSQL schema for the HRIS: 47 tables in 7 areas. The DDL is in [`schema.sql`](schema.sql).
 
 Conventions: `uuid` primary keys; money is `numeric(12,2)` in PHP; times are `timestamptz`; allowed values are enforced with `CHECK`. Computed figures (leave balances, daily attendance results, compliance status) are not stored.
 
@@ -10,7 +10,7 @@ The firm itself: settings, the branch / department / team tree, and the budgeted
 
 ### `company_settings`
 
-Single row of company-wide settings: identity, sign-in security and tardiness flags.
+Single row of company-wide settings: identity, sign-in security, working time and tardiness flags.
 
 | Column | Type | Null | Key | Default | Description |
 |---|---|---|---|---|---|
@@ -27,6 +27,14 @@ Single row of company-wide settings: identity, sign-in security and tardiness fl
 | `tardy_per_month` | smallint | No |  | `5` | Flag someone late this many times in a month (0 = off). |
 | `updated_at` | timestamptz | No |  | `now()` | Last change. |
 | `updated_by` | uuid | Yes | FK → user_accounts |  | Account that made the last change. |
+| `logo_file_id` | uuid | Yes | FK → files |  | Company logo (Settings > Organization). |
+| `default_timezone` | text | No |  | `'Asia/Manila'` | Timezone for anyone who hasn't picked their own. |
+| `currency` | text | No |  | `'PHP'` | Currency shown on amounts; payroll is computed in PHP. |
+| `work_week` | smallint[] | No |  | `'{1,2,3,4,5}'` | Working days, 0 = Sunday to 6 = Saturday. Leave counts only these days. |
+| `work_start` | time | No |  | `'08:30'` | Usual start of the working day. |
+| `work_end` | time | No |  | `'17:30'` | Usual end of the working day. |
+| `fiscal_year_start_month` | smallint | No |  | `1` | Month the fiscal year starts, 1 = January. |
+| `retention_months` | smallint | No |  | `0` | Keep records this many months after separation (0 = keep everything). |
 
 ### `org_units`
 
@@ -93,10 +101,14 @@ The employee master record (201 File core). Fields marked BRD follow the New Emp
 | `email` | varchar(100) | No | UQ |  | BRD. Email address (work). Valid email format. Unique. |
 | `date_hired` | date | No |  |  | BRD. First day of employment. Not more than 30 days in the future (checked by trigger). |
 | `employment_status` | varchar(12) | No |  | `'PROBATIONARY'` | BRD. Employment type. Allowed: `PROBATIONARY`, `REGULAR`, `FIXED_TERM`. |
-| `tin` | varchar(17) | Yes | UQ |  | BRD. Tax Identification Number. Required before first payroll. Unique. |
-| `sss_no` | varchar(12) | Yes | UQ |  | BRD. SSS number. Required before first payroll. Unique. |
-| `philhealth_no` | varchar(14) | Yes | UQ |  | BRD. PhilHealth number. Required before first payroll. Unique. |
-| `pagibig_no` | varchar(14) | Yes | UQ |  | BRD. Pag-IBIG MID number. Required before first payroll. Unique. |
+| `tin` | text | Yes |  |  | BRD. Tax Identification Number, encrypted by the app (AES-256-GCM). Required before first payroll. |
+| `sss_no` | text | Yes |  |  | BRD. SSS number, encrypted by the app (AES-256-GCM). Required before first payroll. |
+| `philhealth_no` | text | Yes |  |  | BRD. PhilHealth number, encrypted by the app (AES-256-GCM). Required before first payroll. |
+| `pagibig_no` | text | Yes |  |  | BRD. Pag-IBIG MID number, encrypted by the app (AES-256-GCM). Required before first payroll. |
+| `tin_hash` | text | Yes | UQ |  | Fingerprint of the TIN (HMAC-SHA256), so no two employees share one. |
+| `sss_no_hash` | text | Yes | UQ |  | Fingerprint of the SSS number (HMAC-SHA256), so no two employees share one. |
+| `philhealth_no_hash` | text | Yes | UQ |  | Fingerprint of the PhilHealth number (HMAC-SHA256), so no two employees share one. |
+| `pagibig_no_hash` | text | Yes | UQ |  | Fingerprint of the Pag-IBIG MID (HMAC-SHA256), so no two employees share one. |
 | `basic_rate` | numeric(12,2) | No |  |  | BRD. Basic monthly salary in PHP; must be > 0. Restricted to HR and Payroll. |
 | `nationality` | varchar(50) | No |  | `'Filipino'` | Nationality. |
 | `photo_file_id` | uuid | Yes | FK → files |  | ID photo. |
@@ -140,11 +152,11 @@ Uploaded files: documents, receipts, photos. Kept in `content` for now; object s
 |---|---|---|---|---|---|
 | `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
 | `storage_key` | text | No | UQ |  | Object-storage key. |
-| `file_name` | text | No |  |  | Original file name. |
+| `file_name` | text | No |  |  | Original file name, encrypted by the app (AES-256-GCM). |
 | `content_type` | text | No |  |  | MIME type. |
 | `size_bytes` | bigint | No |  |  | File size. |
 | `sha256` | text | Yes |  |  | Checksum, to catch duplicates. |
-| `content` | bytea | Yes |  |  | The file itself, while files are kept in the database (null once moved to object storage). |
+| `content` | bytea | Yes |  |  | The file itself, encrypted by the app (AES-256-GCM), while files are kept in the database (null once moved to object storage). |
 | `uploaded_by` | uuid | Yes | FK → user_accounts |  | Account that uploaded it. |
 | `uploaded_at` | timestamptz | No |  | `now()` | Upload time. |
 
@@ -159,13 +171,13 @@ Pre-employment and identity documents in the 201 File checklist.
 | `document_type` | text | No |  |  | Checklist item. Allowed: `Application Form / Resume`, `Birth Certificate (PSA)`, `Marriage Certificate (PSA)`, `Child's Birth Certificate`, `Valid Government ID`, `Diploma / Transcript of Records`, `Professional License`, `Certificate of Employment (Previous)`, `NBI Clearance`, `Police/Barangay Clearance`, `Pre-Employment Medical Result`. |
 | `status` | text | No |  | `'Missing'` | Where it stands. Allowed: `Missing`, `Submitted`, `Verified`, `Not applicable`. |
 | `file_id` | uuid | Yes | FK → files |  | The uploaded scan. |
-| `file_name` | text | Yes |  |  | Name of the submitted file. |
+| `file_name` | text | Yes |  |  | Name of the submitted file, encrypted by the app (AES-256-GCM). |
 | `submitted_at` | timestamptz | Yes |  |  | When it was uploaded. |
 | `verified_by` | uuid | Yes | FK → user_accounts |  | HR account that verified it. |
 | `verified_by_name` | text | Yes |  |  | Name of who verified it, kept if the account goes. |
 | `verified_at` | timestamptz | Yes |  |  | When it was verified. |
 | `id_type` | text | Yes |  |  | For government IDs: UMID, Passport, Driver's License… |
-| `reference_no` | text | Yes |  |  | ID or license number. Sensitive. |
+| `reference_no` | text | Yes |  |  | ID or license number, encrypted by the app (AES-256-GCM). |
 | `expires_on` | date | Yes |  |  | Expiry of the ID, license or clearance; drives renewal alerts. |
 | `note` | text | Yes |  |  | HR note. |
 
@@ -194,7 +206,7 @@ PRC licenses (CPA, lawyer) and CPD unit progress.
 | `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
 | `employee_id` | varchar(20) | No | FK → employees |  | The employee this belongs to. |
 | `license_type` | text | No |  |  | e.g. CPA. |
-| `license_number` | text | No |  |  | PRC license number. |
+| `license_number` | text | No |  |  | PRC license number, encrypted by the app (AES-256-GCM). |
 | `expires_on` | date | Yes |  |  | License validity. |
 | `cpd_units_earned` | numeric(5,1) | No |  | `0` | CPD units earned this cycle. |
 | `cpd_units_required` | numeric(5,1) | No |  | `60` | CPD units required for renewal. |
@@ -250,7 +262,7 @@ Employee relations cases a partner or HR files.
 | `employee_id` | varchar(20) | No | FK → employees |  | The employee this belongs to. |
 | `case_type` | text | No |  |  | Kind of case. Allowed: `Attendance`, `Conduct`, `Performance`, `Grievance`. |
 | `status` | text | No |  | `'Open'` | Case status. Allowed: `Open`, `Under review`, `Resolved`. |
-| `summary` | text | No |  |  | What happened and what was done. |
+| `summary` | text | No |  |  | What happened and what was done, encrypted by the app (AES-256-GCM). |
 | `filed_by` | uuid | No | FK → user_accounts |  | Account that filed it. |
 | `filed_on` | date | No |  | `current_date` | Filing date. |
 
@@ -277,7 +289,7 @@ Resignations and separations with clearance progress.
 | `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
 | `employee_id` | varchar(20) | No | FK → employees |  | The employee this belongs to. |
 | `separation_type` | text | No |  |  | e.g. Voluntary resignation. |
-| `reason` | text | Yes |  |  | Stated reason. |
+| `reason` | text | Yes |  |  | Stated reason, encrypted by the app (AES-256-GCM). |
 | `notice_filed_on` | date | Yes |  |  | When notice was given (30-day rule). |
 | `last_day` | date | No |  |  | Last working day. |
 | `stage` | text | No |  | `'Resignation filed'` | Where it stands. Allowed: `Resignation filed`, `Clearance in progress`, `Final pay released`. |
@@ -504,9 +516,9 @@ Leave filed by or for an employee.
 | `date_to` | date | No |  |  | Last day. |
 | `half_day` | text | Yes |  |  | Half day, only when the dates are equal. Allowed: `am`, `pm`. |
 | `days` | numeric(5,2) | No |  |  | Days charged, after skipping rest days and holidays. |
-| `reason` | text | No |  |  | Reason. |
+| `reason` | text | No |  |  | Reason, encrypted by the app (AES-256-GCM): it can describe an illness. |
 | `attachment_file_id` | uuid | Yes | FK → files |  | Medical certificate or other proof. |
-| `attachment_name` | text | Yes |  |  | Name of the attached file. |
+| `attachment_name` | text | Yes |  |  | Name of the attached file, encrypted by the app (AES-256-GCM). |
 | `status` | text | No |  | `'pending'` | Status. Allowed: `pending`, `approved`, `rejected`, `cancelled`. |
 | `filed_by` | uuid | No | FK → user_accounts |  | Account that filed it (the employee or HR). |
 | `filed_by_name` | text | No |  |  | Name of who filed it. |
@@ -624,7 +636,7 @@ Additions or deductions to one employee's pay in a run.
 
 ### `reimbursement_claims`
 
-Expense claims with a receipt photo.
+Expense claims with a receipt photo. The employee's approver endorses them, then Accounting gives the final approval.
 
 | Column | Type | Null | Key | Default | Description |
 |---|---|---|---|---|---|
@@ -637,39 +649,57 @@ Expense claims with a receipt photo.
 | `amount` | numeric(10,2) | No |  |  | Amount claimed (max 50,000). |
 | `description` | text | No |  |  | What it was for. |
 | `receipt_file_id` | uuid | No | FK → files |  | Receipt photo. |
-| `status` | text | No |  | `'pending'` | Status. Allowed: `pending`, `approved`, `rejected`. |
+| `status` | text | No |  | `'pending'` | Waiting for the approver, endorsed (waiting for Accounting), approved or rejected. Allowed: `pending`, `endorsed`, `approved`, `rejected`. |
 | `filed_at` | timestamptz | No |  | `now()` | When filed. |
 | `decided_by` | uuid | Yes | FK → user_accounts |  | Account that approved or declined it. |
 | `decided_by_name` | text | Yes |  |  | Name of who decided, kept if the account goes. |
 | `decided_at` | timestamptz | Yes |  |  | When it was decided. |
 | `decision_note` | text | Yes |  |  | Note from the approver to the employee. |
+| `approver_decided_by` | uuid | Yes | FK → user_accounts |  | Approver (the employee's supervisor) who endorsed or rejected it. |
+| `approver_decided_by_name` | text | Yes |  |  | Name of that approver, kept if the account goes. |
+| `approver_decided_at` | timestamptz | Yes |  |  | When the approver decided. |
+| `approver_note` | text | Yes |  |  | The approver's note. |
 
 ## Access, workflows & audit
 
 Who can sign in and what they can do, how requests get approved, and the audit trail for every sensitive action.
 
-### `roles`
+### `subscriptions`
 
-Roles that set a user's workspace and module access.
+The company's HRIS plan (SaaS): plan, seat limit and billing period. One row per period; the newest one not cancelled or expired is current.
 
 | Column | Type | Null | Key | Default | Description |
 |---|---|---|---|---|---|
-| `id` | text | No | PK |  | Role key, e.g. super-admin, hr. |
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `plan_name` | text | No |  |  | Plan the company is on, e.g. Starter, Business. |
+| `status` | text | No |  | `'active'` | Trial, active, past due (payment late), cancelled or expired. Allowed: `trial`, `active`, `past_due`, `cancelled`, `expired`. |
+| `seat_limit` | integer | Yes |  |  | Most sign-in accounts the plan covers (System Admin accounts don't count); empty = no limit. |
+| `billing_cycle` | text | No |  | `'monthly'` | How often it's billed. Allowed: `monthly`, `yearly`. |
+| `price_per_seat` | numeric(10,2) | Yes |  |  | Price per seat per billing cycle. |
+| `currency` | text | No |  | `'PHP'` | Currency of the price. |
+| `starts_on` | date | No |  | `current_date` | First day of this subscription. |
+| `current_period_end` | date | Yes |  |  | When the current billing period ends (renewal date). |
+| `trial_ends_on` | date | Yes |  |  | Last day of the trial, while on trial. |
+| `cancelled_at` | timestamptz | Yes |  |  | When it was cancelled. |
+| `notes` | text | Yes |  |  | Notes from our team, e.g. the contract or invoice reference. |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
+| `created_by` | uuid | Yes | FK → user_accounts |  | Account that set it up. |
+| `updated_at` | timestamptz | No |  | `now()` | Last change. |
+| `updated_by` | uuid | Yes | FK → user_accounts |  | Account that made the last change. |
+
+### `roles`
+
+The six fixed roles. What each may do is the access matrix in the app (src/lib/permissions.ts).
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | text | No | PK |  | Role id, e.g. super-admin, hr. |
+| `role_key` | text | No | UQ |  | Which of the six roles, as the access matrix names it. Allowed: `system_admin`, `super_admin`, `hr`, `approver`, `accounting`, `employee`. |
 | `name` | text | No | UQ |  | Display name. |
 | `description` | text | No |  |  | What the role is for. |
 | `workspace` | text | No |  |  | Workspace it signs into. Allowed: `employee`, `manager`, `admin`. |
 | `is_built_in` | boolean | No |  | `false` | Built-in roles can't be deleted. |
 | `is_super_admin` | boolean | No |  | `false` | Manages roles, settings and other super admins. |
-
-### `role_module_access`
-
-Access a role has to each HR-workspace module.
-
-| Column | Type | Null | Key | Default | Description |
-|---|---|---|---|---|---|
-| `role_id` | text | No | PK, FK → roles |  | The role. |
-| `module` | text | No | PK |  | Module. Allowed: `people`, `company`, `documents`, `timekeeping`, `leave`, `reimbursements`, `reports`, `payroll`, `administration`. |
-| `access` | text | No |  | `'none'` | Level. Allowed: `none`, `view`, `edit`, `approve`. |
 
 ### `user_accounts`
 
@@ -679,7 +709,7 @@ Sign-in accounts. Linked to an employee when the user is one.
 |---|---|---|---|---|---|
 | `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
 | `username` | text | No | UQ |  | Sign-in name. |
-| `builtin_key` | text | Yes | UQ |  | Marks the four built-in accounts. Allowed: `superadmin`, `admin`, `hr`, `employee`. |
+| `builtin_key` | text | Yes | UQ |  | Marks the accounts created at setup. Allowed: `superadmin`, `admin`, `hr`, `employee`. |
 | `display_name` | text | No |  |  | Name shown in the app. |
 | `password_hash` | text | No |  |  | Argon2id or bcrypt hash; never the password. |
 | `employee_id` | varchar(20) | Yes | FK → employees, UQ |  | Employee record, if any. |
@@ -690,6 +720,10 @@ Sign-in accounts. Linked to an employee when the user is one.
 | `failed_attempts` | smallint | No |  | `0` | Failed sign-ins since the last success. |
 | `locked_until` | timestamptz | Yes |  |  | Locked until this time. |
 | `created_at` | timestamptz | No |  | `now()` | When the row was created. |
+| `mfa_secret` | text | Yes |  |  | Authenticator-app (TOTP) secret once two-factor sign-in is on, encrypted by the app (AES-256-GCM). |
+| `mfa_pending_secret` | text | Yes |  |  | Secret being set up, until the first code confirms it; encrypted by the app. |
+| `mfa_enabled_at` | timestamptz | Yes |  |  | When two-factor sign-in was turned on; empty = off. |
+| `mfa_last_step` | bigint | Yes |  |  | Last 30-second code step used, so a code can't be used twice. |
 
 ### `user_sessions`
 
@@ -703,6 +737,19 @@ Signed-in sessions. The browser holds the token in an HttpOnly cookie; only its 
 | `last_seen_at` | timestamptz | No |  | `now()` | Last request; idle sessions expire. |
 | `expires_at` | timestamptz | No |  |  | Hard expiry. |
 | `user_agent` | text | Yes |  |  | Browser, for the sign-in log. |
+| `mfa_pending` | boolean | No |  | `false` | Password was right but the two-factor code isn't entered yet: this session can only enter the code. |
+
+### `mfa_backup_codes`
+
+One-time backup codes for two-factor sign-in, for when the phone is lost. Only hashes are stored.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `account_id` | uuid | No | FK → user_accounts |  | Whose code. |
+| `code_hash` | text | No |  |  | Argon2 hash of the code; never the code. |
+| `used_at` | timestamptz | Yes |  |  | When it was used; each code works once. |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
 
 ### `approval_workflows`
 

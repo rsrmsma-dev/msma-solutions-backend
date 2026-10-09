@@ -5,8 +5,10 @@
 import type pg from "pg";
 import { CREDITS_ADJUSTMENT, creditsOf, DEFAULT_TYPES, fmtCredits, isoToday, LEAVE_CREDITS_PER_YEAR, previewOf, type FileInput, type LeaveData, type LeavePersonFacts } from "../../src/lib/leave/rules";
 import type { LeaveType } from "../../src/lib/leave/types";
-import { audit, can, demand, type Session } from "./auth";
+import { audit, can, demand, seenIds, type Session } from "./auth";
 import { clean, pool, tx, UserError, type Db } from "./db";
+import { getSettings } from "./admin";
+import { open, seal } from "./crypto";
 
 export { DEFAULT_TYPES };
 
@@ -21,19 +23,23 @@ function typeJson(r: any): LeaveType {
   };
 }
 
-/** Everything the rules look at, in the browser's shapes. Inside a transaction when deciding. */
+/**
+ * Everything the rules look at, in the browser's shapes, with the company's work week (Settings >
+ * Organization) so days are counted as the form counts them. Inside a transaction when deciding.
+ * One query at a time: inside a transaction the client can't run two at once.
+ */
 async function loadData(db: Db): Promise<LeaveData> {
-  const [types, requests, adjustments, carry] = await Promise.all([
-    db.query(`select * from leave_types order by name`),
-    db.query(`select * from leave_requests order by filed_at desc`),
-    db.query(`select * from leave_adjustments order by adjusted_at desc`),
-    db.query(`select * from leave_carry_overs where leave_year = $1`, [Number(isoToday().slice(0, 4))]),
-  ]);
+  const types = await db.query(`select * from leave_types order by name`);
+  const requests = await db.query(`select * from leave_requests order by filed_at desc`);
+  const adjustments = await db.query(`select * from leave_adjustments order by adjusted_at desc`);
+  const carry = await db.query(`select * from leave_carry_overs where leave_year = $1`, [Number(isoToday().slice(0, 4))]);
+  const { workWeek } = await getSettings(db);
   return {
+    workWeek,
     types: types.rows.map(typeJson),
     requests: requests.rows.map((r) => clean({
       id: r.id, employeeId: r.employee_id, typeId: r.leave_type_id, start: r.date_from, end: r.date_to, halfDay: r.half_day, days: r.days,
-      reason: r.reason, attachment: r.attachment_name, status: r.status, filedBy: r.filed_by_name, filedAt: iso(r.filed_at)!,
+      reason: open(r.reason), attachment: r.attachment_name ? open(r.attachment_name) : undefined, status: r.status, filedBy: r.filed_by_name, filedAt: iso(r.filed_at)!,
       decidedBy: r.decided_by_name, decidedAt: iso(r.decided_at), note: r.decision_note,
     })),
     adjustments: adjustments.rows.map((a) => ({ id: a.id, employeeId: a.employee_id, typeId: a.leave_type_id ?? CREDITS_ADJUSTMENT, days: a.days, reason: a.reason, by: a.adjusted_by_name, at: iso(a.adjusted_at)! })),
@@ -52,17 +58,22 @@ async function facts(db: Db, employeeId: string): Promise<LeavePersonFacts | und
 
 export async function loadState(s: Session): Promise<LeaveData> {
   const data = await loadData(pool);
-  if (can(s, "leave", "view")) return data;
-  // Without Leave access: your own requests in full; for everyone else only who is away when
-  // (for calendars and attendance), never the reason, attachment or HR's note.
+  const requests = seenIds(s, "leave");
+  const balances = seenIds(s, "leaveBalances");
+  if (requests === "all" && balances === "all") return data;
+  // Requests in full for those the role may see (their own, their team) and yourself; for everyone
+  // else only who is away when (calendars, attendance and payroll need it), never the reason,
+  // attachment or HR's note.
   const me = s.employeeNo ?? "";
+  const full = (id: string) => id === me || requests === "all" || requests.includes(id);
+  const bal = (id: string) => id === me || balances === "all" || balances.includes(id);
   return {
     ...data,
     requests: data.requests
-      .filter((r) => r.employeeId === me || r.status === "approved" || r.status === "pending")
-      .map((r) => (r.employeeId === me ? r : { ...r, reason: "", attachment: undefined, note: undefined, filedBy: "", decidedBy: undefined })),
-    adjustments: data.adjustments.filter((a) => a.employeeId === me),
-    carryOver: Object.fromEntries(Object.entries(data.carryOver).filter(([k]) => k.startsWith(`${me}|`))),
+      .filter((r) => full(r.employeeId) || r.status === "approved" || r.status === "pending")
+      .map((r) => (full(r.employeeId) ? r : { ...r, reason: "", attachment: undefined, note: undefined, filedBy: "", decidedBy: undefined })),
+    adjustments: data.adjustments.filter((a) => bal(a.employeeId)),
+    carryOver: Object.fromEntries(Object.entries(data.carryOver).filter(([k]) => bal(k.split("|")[0]!))),
   };
 }
 
@@ -82,9 +93,8 @@ export async function fileLeave(s: Session, body: any) {
     attachment: str("attachment") || undefined, approveNow: body?.approveNow === true,
   };
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.start) || !/^\d{4}-\d{2}-\d{2}$/.test(input.end)) throw new UserError("Pick the start and end dates");
-  const own = !!s.employeeNo && input.employeeId === s.employeeNo;
-  if (!own) demand(s, "leave", "edit");
-  if (input.approveNow) demand(s, "leave", "approve");
+  demand(s, "create", "leave", input.employeeId);
+  if (input.approveNow) demand(s, "approve", "leave", input.employeeId);
   if (!String(input.reason ?? "").trim()) throw new UserError("Give a short reason");
   return tx(async (c) => {
     await lockEmployee(c, input.employeeId);
@@ -94,7 +104,7 @@ export async function fileLeave(s: Session, body: any) {
     const { rows: [r] } = await c.query(
       `insert into leave_requests (employee_id, leave_type_id, date_from, date_to, half_day, days, reason, attachment_name, status, filed_by, filed_by_name, decided_by, decided_by_name, decided_at)
        values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) returning id`,
-      [input.employeeId, input.typeId, input.start, input.end, halfDay, p.days, input.reason.trim(), input.attachment || null, input.approveNow ? "approved" : "pending",
+      [input.employeeId, input.typeId, input.start, input.end, halfDay, p.days, seal(input.reason.trim()), seal(input.attachment), input.approveNow ? "approved" : "pending",
         s.accountId, s.name, input.approveNow ? s.accountId : null, input.approveNow ? s.name : null, input.approveNow ? new Date() : null],
     );
     await log(c, s, input.approveNow ? "Filed and approved leave" : "Filed leave", input.employeeId, `${input.start}${input.end !== input.start ? ` to ${input.end}` : ""} (${p.days} days)`);
@@ -103,10 +113,10 @@ export async function fileLeave(s: Session, body: any) {
 }
 
 export async function decideRequest(s: Session, id: string, approve: boolean, note: string) {
-  demand(s, "leave", "approve");
   return tx(async (c) => {
     const r = (await c.query(`select * from leave_requests where id::text = $1`, [id])).rows[0];
     if (!r) throw new UserError("That request no longer exists", 404);
+    demand(s, "approve", "leave", r.employee_id);
     await lockEmployee(c, r.employee_id);
     const cur = (await c.query(`select status from leave_requests where id = $1`, [r.id])).rows[0];
     if (cur.status !== "pending") throw new UserError("This request was already decided");
@@ -129,7 +139,9 @@ export async function cancelRequest(s: Session, id: string, note: string) {
   return tx(async (c) => {
     const r = (await c.query(`select * from leave_requests where id::text = $1 for update`, [id])).rows[0];
     if (!r) throw new UserError("That request no longer exists", 404);
-    if (!(s.employeeNo && r.employee_id === s.employeeNo)) demand(s, "leave", "edit");
+    // Approvers of this person's leave, or the person themself (when they may file their own).
+    const own = !!s.employeeNo && r.employee_id === s.employeeNo && can(s, "create", "leave", r.employee_id);
+    if (!own) demand(s, "approve", "leave", r.employee_id);
     if (r.status !== "pending" && r.status !== "approved") throw new UserError("This request is already closed");
     if (r.status === "approved" && r.date_from <= isoToday()) throw new UserError("This leave has already started and can't be cancelled");
     if (!note.trim()) throw new UserError("Say why it's being cancelled");
@@ -142,7 +154,7 @@ export async function cancelRequest(s: Session, id: string, note: string) {
 // ---- Credits (6 a year, shared by every paid leave type) ----
 
 export async function adjustCredits(s: Session, input: { employeeId?: string; leaves?: number; reason?: string }) {
-  demand(s, "leave", "edit");
+  demand(s, "edit", "leaveBalances", String(input.employeeId ?? ""));
   const leaves = Number(input.leaves);
   const reason = String(input.reason ?? "").trim();
   if (!Number.isInteger(leaves) || leaves === 0) throw new UserError("Enter the leaves to add (e.g. 1) or remove (e.g. -1)");
@@ -166,7 +178,7 @@ export async function adjustCredits(s: Session, input: { employeeId?: string; le
 // ---- Types ----
 
 export async function saveType(s: Session, input: any) {
-  demand(s, "leave", "edit");
+  demand(s, input?.id ? "edit" : "create", "leaveTypes");
   const name = String(input?.name ?? "").trim();
   const code = String(input?.code ?? "").trim().toUpperCase();
   if (!name) throw new UserError("Name the leave type");
@@ -197,7 +209,7 @@ export async function saveType(s: Session, input: any) {
 }
 
 export async function setTypeActive(s: Session, id: string, active: boolean) {
-  demand(s, "leave", "edit");
+  demand(s, "edit", "leaveTypes");
   const { rows } = await pool.query(`update leave_types set is_active = $2 where id = $1 returning name`, [id, active]);
   if (!rows[0]) throw new UserError("That leave type no longer exists", 404);
   await audit(pool, { actorId: s.accountId, actorName: s.name, module: "Leave", action: active ? "Turned on leave type" : "Turned off leave type", target: rows[0].name });

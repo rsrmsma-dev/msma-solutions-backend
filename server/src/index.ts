@@ -1,9 +1,10 @@
 // HeyHR API server. The Vite dev server proxies /api here, so the browser sees one origin.
 
 import cookie from "@fastify/cookie";
-import Fastify from "fastify";
+import Fastify, { type FastifyReply } from "fastify";
 import { COOKIE, accountJson, requireSession, signIn, signOut, loadSession } from "./auth.js";
 import * as admin from "./admin.js";
+import * as mfa from "./mfa.js";
 import * as corehr from "./corehr.js";
 import * as leave from "./leave.js";
 import * as tk from "./timekeeping.js";
@@ -12,8 +13,49 @@ import * as reimb from "./reimbursements.js";
 import * as records from "./records.js";
 import { pool, UserError } from "./db.js";
 
-const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: 1_000_000 });
+// Behind a reverse proxy (nginx, a load balancer), set TRUST_PROXY=1 so each visitor's own address is
+// used for the sign-in and registration limits instead of the proxy's.
+const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? "info" }, bodyLimit: 1_000_000, trustProxy: process.env.TRUST_PROXY === "1" });
 await app.register(cookie);
+
+// Only JSON bodies. Fastify also reads text/plain by default, which a form on another website can send.
+app.removeContentTypeParser("text/plain");
+
+// Changes only from this website: browsers mark requests another site starts (Sec-Fetch-Site), so a
+// page elsewhere can't make a signed-in person's browser post here (cross-site request forgery).
+app.addHook("onRequest", async (req, reply) => {
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return;
+  const site = req.headers["sec-fetch-site"];
+  if (site === "cross-site" || site === "same-site") return reply.code(403).send({ error: "Requests from other websites aren't allowed." });
+});
+
+// Standard protective headers on every response. HTTPS-only (HSTS) is sent when cookies are HTTPS-only.
+app.addHook("onSend", async (_req, reply, payload) => {
+  reply.header("x-content-type-options", "nosniff");
+  reply.header("x-frame-options", "DENY");
+  reply.header("referrer-policy", "no-referrer");
+  reply.header("cross-origin-resource-policy", "same-origin");
+  if (!reply.hasHeader("content-security-policy")) reply.header("content-security-policy", "default-src 'none'; frame-ancestors 'none'");
+  if (process.env.COOKIE_SECURE !== "false") reply.header("strict-transport-security", "max-age=31536000; includeSubDomains");
+  return payload;
+});
+
+/**
+ * Sends a stored file. Uploaded images (an SVG can carry script) open in a sandbox with no script;
+ * PDFs open in the browser's viewer, which runs them in its own sandbox.
+ */
+function sendFile(reply: FastifyReply, f: { contentType: string; bytes: Buffer }, maxAge: number) {
+  reply.header("content-type", f.contentType).header("cache-control", `private, max-age=${maxAge}`);
+  if (f.contentType !== "application/pdf") reply.header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+  return reply.send(f.bytes);
+}
+
+// Sign-in tries per network address: slows password guessing across many accounts (the per-account
+// lock only covers one). Failed tries only; a success clears the address.
+const LOGIN_TRIES = 20;
+const LOGIN_WINDOW_MS = 15 * 60_000;
+const loginFails = new Map<string, number[]>();
+const recentFails = (ip: string) => (loginFails.get(ip) ?? []).filter((t) => Date.now() - t < LOGIN_WINDOW_MS);
 
 /** Database rule violations, said the way the form would say them. */
 const CONSTRAINT_MESSAGES: Record<string, string> = {
@@ -21,10 +63,10 @@ const CONSTRAINT_MESSAGES: Record<string, string> = {
   employees_email_key: "Another employee already uses that email",
   employees_email_ci: "Another employee already uses that email",
   employees_mobile_no_key: "Another employee already uses that mobile number",
-  employees_tin_key: "Another employee already has that TIN",
-  employees_sss_no_key: "Another employee already has that SSS number",
-  employees_philhealth_no_key: "Another employee already has that PhilHealth number",
-  employees_pagibig_no_key: "Another employee already has that Pag-IBIG MID",
+  employees_tin_hash_key: "Another employee already has that TIN",
+  employees_sss_no_hash_key: "Another employee already has that SSS number",
+  employees_philhealth_no_hash_key: "Another employee already has that PhilHealth number",
+  employees_pagibig_no_hash_key: "Another employee already has that Pag-IBIG MID",
   employees_mobile_format: "Use an 11-digit mobile number, e.g. 09171234567",
   employees_email_format: "Enter a valid email",
   employees_names_letters: "Names can only have letters",
@@ -50,9 +92,36 @@ const cookieOptions = { path: "/", httpOnly: true, sameSite: "lax" as const, sec
 // ---- Sign-in ----
 
 app.post<{ Body: { username?: string; password?: string } }>("/api/auth/login", async (req, reply) => {
-  const { token, workspace, account } = await signIn(String(req.body?.username ?? ""), String(req.body?.password ?? ""), req.headers["user-agent"]);
+  if (recentFails(req.ip).length >= LOGIN_TRIES) return reply.code(429).send({ error: "Too many sign-in attempts from this network. Wait 15 minutes and try again." });
+  let result;
+  try {
+    result = await signIn(String(req.body?.username ?? ""), String(req.body?.password ?? ""), req.headers["user-agent"]);
+  } catch (e) {
+    if (e instanceof UserError && e.status === 401) loginFails.set(req.ip, [...recentFails(req.ip), Date.now()]);
+    throw e;
+  }
+  loginFails.delete(req.ip);
+  if ("mfaRequired" in result) {
+    // The password was right; the browser now sends the code from the authenticator app (/api/auth/mfa).
+    reply.setCookie(COOKIE, result.token, cookieOptions);
+    return { mfaRequired: true };
+  }
+  const { token, workspace, account } = result;
   reply.setCookie(COOKIE, token, cookieOptions);
   return { workspace, account };
+});
+
+// The second sign-in step: the 6-digit code from the authenticator app, or a backup code.
+app.post<{ Body: { code?: string } }>("/api/auth/mfa", async (req, reply) => {
+  if (recentFails(req.ip).length >= LOGIN_TRIES) return reply.code(429).send({ error: "Too many sign-in attempts from this network. Wait 15 minutes and try again." });
+  const r = await mfa.verifyLogin(req.cookies[COOKIE], String(req.body?.code ?? ""));
+  if ("error" in r) {
+    loginFails.set(req.ip, [...recentFails(req.ip), Date.now()]);
+    if (r.locked) reply.clearCookie(COOKIE, cookieOptions);
+    return reply.code(401).send({ error: r.error });
+  }
+  loginFails.delete(req.ip);
+  return r.ok;
 });
 
 // Employees HR already added create their own sign-in (no session needed).
@@ -86,7 +155,7 @@ app.register(async (r) => {
     const d = (await pool.query(`select file_id from employee_documents where id::text = $1`, [req.params.id])).rows[0];
     if (!d?.file_id) return reply.code(404).send({ error: "No file uploaded yet" });
     const f = await reimb.readFile(req.session!, d.file_id);
-    return reply.header("content-type", f.contentType).header("cache-control", "private, max-age=600").header("x-content-type-options", "nosniff").send(f.bytes);
+    return sendFile(reply, f, 600);
   });
 
   r.post<{ Body: { values: unknown } }>("/api/corehr/employees", (req) => corehr.createEmployee(req.session!, req.body?.values));
@@ -169,7 +238,7 @@ app.register(async (r) => {
     reimb.decideClaim(req.session!, req.params.id, !!req.body?.approve, String(req.body?.note ?? "")));
   r.get<{ Params: { id: string } }>("/api/files/:id", async (req, reply) => {
     const f = await reimb.readFile(req.session!, req.params.id);
-    return reply.header("content-type", f.contentType).header("cache-control", "private, max-age=3600").header("x-content-type-options", "nosniff").send(f.bytes);
+    return sendFile(reply, f, 3600);
   });
 });
 
@@ -201,6 +270,14 @@ app.register(async (r) => {
 app.register(async (r) => {
   r.addHook("preHandler", requireSession);
 
+  // Two-factor sign-in (Settings › Security).
+  r.get("/api/me/mfa", (req) => mfa.status(req.session!));
+  r.post("/api/me/mfa/setup", (req) => mfa.setup(req.session!));
+  r.post<{ Body: { code?: string } }>("/api/me/mfa/enable", (req) => mfa.enable(req.session!, String(req.body?.code ?? "")));
+  r.post<{ Body: { password?: string; code?: string } }>("/api/me/mfa/disable", (req) => mfa.disable(req.session!, String(req.body?.password ?? ""), String(req.body?.code ?? "")));
+  r.post<{ Body: { code?: string } }>("/api/me/mfa/backup-codes", (req) => mfa.regenerateBackupCodes(req.session!, String(req.body?.code ?? "")));
+  r.post<{ Params: { id: string } }>("/api/admin/accounts/:id/mfa-reset", async (req) => (await admin.resetMfa(req.session!, req.params.id), { ok: true }));
+
   r.post<{ Body: { currentPassword?: string; newPassword?: string } }>("/api/auth/change-password", (req) =>
     admin.changeOwnPassword(req.session!, String(req.body?.currentPassword ?? ""), String(req.body?.newPassword ?? "")));
 
@@ -220,8 +297,13 @@ app.register(async (r) => {
   r.get("/api/settings", () => admin.getSettings());
   r.get("/api/workflows", () => admin.listWorkflows());
   r.put<{ Body: any }>("/api/admin/workflows", (req) => admin.saveWorkflow(req.session!, req.body));
-  r.put<{ Body: any }>("/api/admin/settings", (req) => admin.saveSettings(req.session!, req.body));
+  // The company logo comes in as a data URL (up to 1 MB as a file).
+  r.put<{ Body: any }>("/api/admin/settings", { bodyLimit: 2 * 1024 * 1024 }, (req) => admin.saveSettings(req.session!, req.body));
   r.get("/api/admin/audit", (req) => admin.listAdminAudit(req.session!));
+
+  // Subscription plan and seats (SaaS).
+  r.get("/api/admin/subscription", (req) => admin.getSubscription(req.session!));
+  r.put<{ Body: any }>("/api/admin/subscription", (req) => admin.saveSubscription(req.session!, req.body));
 });
 
 app.get("/api/health", async () => {

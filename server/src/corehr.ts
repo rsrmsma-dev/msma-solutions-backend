@@ -7,7 +7,9 @@
 
 import type pg from "pg";
 import { contactSchema, governmentSchema, newEmployeeSchema, personalSchema } from "../../src/lib/corehr/schemas.js";
-import { audit, can, demand, type Session } from "./auth.js";
+import { audit, can, demand, scopeOf, seen, seenIds, type Session } from "./auth.js";
+import { createHash } from "node:crypto";
+import { fingerprint, open, seal, sealBytes } from "./crypto.js";
 import { clean, pool, tx, UserError, type Db } from "./db.js";
 
 const DOCUMENT_TYPES = [
@@ -60,7 +62,7 @@ function employeeJson(r: any) {
       workEmail: r.email ?? "", personalEmail: r.personal_email ?? "", mobile: r.mobile_no ?? "", address: r.address_line ?? "", city: r.city ?? "", province: r.province ?? "",
       emergencyName: r.emergency_name ?? "", emergencyRelationship: r.emergency_relationship ?? "", emergencyPhone: r.emergency_phone ?? "",
     },
-    government: { sss: r.sss_no ?? "", philhealth: r.philhealth_no ?? "", pagibig: r.pagibig_no ?? "", tin: r.tin ?? "" },
+    government: { sss: open(r.sss_no), philhealth: open(r.philhealth_no), pagibig: open(r.pagibig_no), tin: open(r.tin) },
     job: {
       positionId: r.position_id ?? "", unitId: r.org_unit_id ?? "", supervisorId: r.supervisor_id, employmentType: FROM.employment[r.employment_status], status: FROM.record[r.record_status],
       dateHired: r.date_hired, regularizationDate: r.regularization_date, separationDate: r.separation_date, monthlySalary: r.basic_rate, workSchedule: r.work_schedule ?? "",
@@ -73,10 +75,14 @@ function employeeJson(r: any) {
 const employeeRow = async (db: Db, id: string) => (await db.query(`select * from employees where employee_id = $1`, [id])).rows[0];
 
 export async function loadState(s: Session) {
-  const full = can(s, "people", "view");
-  // Payroll works out pay from salary, so it sees salaries (not the rest of the 201 File).
-  const pay = can(s, "payroll", "view");
+  // Full records for everyone, an approver's team, or only yourself (the access matrix's People row).
+  const scope = seenIds(s, "people");
   const me = s.employeeNo ?? "";
+  const fullIds = scope === "all" ? [] : [...new Set([...scope, me])];
+  const full = scope === "all";
+  const isFull = (id: string) => full || fullIds.includes(id);
+  // Payroll works out pay from salary, so whoever runs payroll sees salaries.
+  const pay = can(s, "view", "payrollRuns") && scopeOf(s, "view", "payrollRuns") === "all";
   const [units, positions, employees, documents, events, auditRows] = await Promise.all([
     pool.query(`select id, unit_type as type, name, code, parent_id as "parentId", head_employee_id as "headEmployeeId", address, is_active as active from org_units order by unit_type, name`),
     pool.query(`select id, title, code, department_id as "departmentId", job_level as level, default_employment_type as "employmentType", budgeted_slots as slots,
@@ -84,18 +90,18 @@ export async function loadState(s: Session) {
     pool.query(`select * from employees order by last_name, first_name`),
     pool.query(`select id, employee_id as "employeeId", document_type as type, status, file_name as "fileName", to_char(submitted_at, 'YYYY-MM-DD') as "uploadedAt", id_type as "idType", (file_id is not null) as "hasFile",
                        verified_by_name as "verifiedBy", verified_at as "verifiedAt", reference_no as "referenceNo", expires_on as "expiresOn", note
-                  from employee_documents where $1 or employee_id = $2`, [full, me]),
+                  from employee_documents where $1 or employee_id = any($2)`, [full, fullIds]),
     pool.query(`select id, employee_id as "employeeId", event_kind as kind, effective_date as "effectiveDate", changes, remarks, recorded_by_name as "recordedBy", recorded_at as "recordedAt"
-                  from job_events where $1 or employee_id = $2`, [full, me]),
-    full
-      ? pool.query(`select id::text, employee_id as "employeeId", actor_name as actor, action, target as section, coalesce(detail, '') as summary, occurred_at as at
-                      from audit_log where module = 'People' and employee_id is not null order by occurred_at desc limit 5000`)
-      : { rows: [] },
+                  from job_events where $1 or employee_id = any($2)`, [full, fullIds]),
+    pool.query(`select id::text, employee_id as "employeeId", actor_name as actor, action, target as section, coalesce(detail, '') as summary, occurred_at as at
+                  from audit_log where module = 'People' and employee_id is not null and ($1 or employee_id = any($2)) order by occurred_at desc limit 5000`, [full, scope === "all" ? [] : scope]),
   ]);
-  const emps = employees.rows.map((r) => {
+  // Roles with no People access at all (System Admin: our team) see no client employees.
+  const noPeople = scopeOf(s, "view", "people") === null && !me;
+  const emps = (noPeople ? [] : employees.rows).map((r) => {
     const e = employeeJson(r);
     // Without People access, other people's records show only what a directory would.
-    if (full || e.id === me) return e;
+    if (isFull(e.id)) return e;
     return {
       ...e,
       personal: { ...e.personal, birthDate: "", sex: "", civilStatus: "" },
@@ -105,7 +111,7 @@ export async function loadState(s: Session) {
     };
   });
   const posJson = positions.rows.map((p) => ({ ...p, employmentType: FROM.employment[p.employmentType] }));
-  return { units: clean(units.rows), positions: clean(posJson), employees: emps, documents: clean(documents.rows), events: clean(events.rows), audit: clean(auditRows.rows) };
+  return { units: clean(units.rows), positions: clean(posJson), employees: emps, documents: clean(documents.rows.map((d) => ({ ...d, referenceNo: d.referenceNo && open(d.referenceNo), fileName: d.fileName && open(d.fileName) }))), events: clean(events.rows), audit: clean(auditRows.rows) };
 }
 
 // ---- Helpers ----
@@ -142,7 +148,7 @@ async function insertDocuments(c: pg.PoolClient, employeeId: string, married: bo
     const gov = type === "Valid Government ID" && govId;
     await c.query(
       `insert into employee_documents (employee_id, document_type, status, file_name, submitted_at, id_type, reference_no, expires_on) values ($1, $2, $3, $4, $5, $6, $7, $8)`,
-      [employeeId, type, gov ? "Submitted" : na ? "Not applicable" : "Missing", gov ? govId.fileName ?? null : null, gov ? new Date() : null, gov ? govId.idType ?? null : null, gov ? govId.idNumber || null : null, gov ? govId.idExpiry || null : null],
+      [employeeId, type, gov ? "Submitted" : na ? "Not applicable" : "Missing", gov ? seal(govId.fileName) : null, gov ? new Date() : null, gov ? govId.idType ?? null : null, gov ? seal(govId.idNumber) : null, gov ? govId.idExpiry || null : null],
     );
   }
 }
@@ -150,7 +156,7 @@ async function insertDocuments(c: pg.PoolClient, employeeId: string, married: bo
 // ---- Employees ----
 
 export async function createEmployee(s: Session, values: unknown) {
-  demand(s, "people", "edit");
+  demand(s, "create", "people");
   const parsed = newEmployeeSchema.safeParse(values);
   if (!parsed.success) throw new UserError(firstIssue(parsed));
   const v = parsed.data;
@@ -175,11 +181,13 @@ export async function createEmployee(s: Session, values: unknown) {
     const { rows: [e] } = await c.query(
       `insert into employees (employee_id, first_name, middle_name, last_name, suffix, birth_date, sex, civil_status, nationality,
          email, personal_email, mobile_no, address_line, city, province, emergency_name, emergency_relationship, emergency_phone,
-         sss_no, philhealth_no, pagibig_no, tin, position_id, org_unit_id, supervisor_id, employment_status, date_hired, basic_rate, work_schedule)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29) returning employee_id`,
+         sss_no, philhealth_no, pagibig_no, tin, position_id, org_unit_id, supervisor_id, employment_status, date_hired, basic_rate, work_schedule,
+         sss_no_hash, philhealth_no_hash, pagibig_no_hash, tin_hash)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33) returning employee_id`,
       [await nextEmployeeId(c), p.firstName, p.middleName || null, p.lastName, p.suffix || null, p.birthDate, SEX[p.sex as keyof typeof SEX], CIVIL[p.civilStatus as keyof typeof CIVIL], p.nationality || "Filipino",
         ct.workEmail, ct.personalEmail, toMobileNo(ct.mobile), ct.address, ct.city, ct.province, ct.emergencyName, ct.emergencyRelationship, ct.emergencyPhone,
-        g.sss || null, g.philhealth || null, g.pagibig || null, g.tin || null, position.id, team.id, supervisorId, EMPLOYMENT[v.job.employmentType as keyof typeof EMPLOYMENT], v.job.dateHired, v.job.monthlySalary, v.job.workSchedule],
+        seal(g.sss), seal(g.philhealth), seal(g.pagibig), seal(g.tin), position.id, team.id, supervisorId, EMPLOYMENT[v.job.employmentType as keyof typeof EMPLOYMENT], v.job.dateHired, v.job.monthlySalary, v.job.workSchedule,
+        fingerprint(g.sss), fingerprint(g.philhealth), fingerprint(g.pagibig), fingerprint(g.tin)],
     );
     const id = e.employee_id as string;
     // Every checklist item starts Missing (or Not applicable); an ID scanned to fill the form is not kept.
@@ -229,7 +237,7 @@ function toDb(field: string, v: string): string | null {
 export async function updateSection(s: Session, id: string, section: string, values: unknown) {
   // Employees keep their own contact details up to date (not their work email, which HR assigns).
   const selfContact = section === "contact" && !!s.employeeNo && s.employeeNo === id;
-  if (!selfContact) demand(s, "people", "edit");
+  if (!selfContact) demand(s, "edit", "people", id);
   const def = SECTIONS[section as Section];
   if (!def) throw new UserError("Unknown section");
   const parsed = def.schema.safeParse(values);
@@ -239,11 +247,14 @@ export async function updateSection(s: Session, id: string, section: string, val
     const row = (await c.query(`select * from employees where employee_id = $1 for update`, [id])).rows[0];
     if (!row) throw new UserError("That employee no longer exists", 404);
     const before = (employeeJson(row) as any)[section] as Record<string, string>;
-    if (selfContact && !can(s, "people", "edit") && (after.workEmail ?? "") !== (before.workEmail ?? "")) throw new UserError("Ask HR to change your work email");
+    if (selfContact && !can(s, "edit", "people", id) && (after.workEmail ?? "") !== (before.workEmail ?? "")) throw new UserError("Ask HR to change your work email");
     const changed = Object.keys(def.labels).filter((k) => (before[k] ?? "") !== (after[k] ?? ""));
     if (changed.length) {
-      const sets = changed.map((k, i) => `${def.cols[k]} = $${i + 2}`).join(", ");
-      await c.query(`update employees set ${sets}, updated_at = now() where employee_id = $1`, [id, ...changed.map((k) => toDb(k, after[k] ?? ""))]);
+      // Government numbers are stored encrypted, each with its fingerprint (see crypto.ts).
+      const pairs = changed.flatMap((k): [string, string | null][] =>
+        section === "government" ? [[def.cols[k]!, seal(after[k])], [`${def.cols[k]}_hash`, fingerprint(after[k])]] : [[def.cols[k]!, toDb(k, after[k] ?? "")]]);
+      const sets = pairs.map(([col], i) => `${col} = $${i + 2}`).join(", ");
+      await c.query(`update employees set ${sets}, updated_at = now() where employee_id = $1`, [id, ...pairs.map(([, v]) => v)]);
       // Sensitive values are named in the trail, never written into it.
       const summary = section === "government" ? `Changed ${changed.map((k) => def.labels[k]).join(", ")}` : changed.map((k) => `${def.labels[k]}: ${before[k] || "—"} → ${after[k] || "—"}`).join("; ");
       await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: def.title, employeeNo: id, detail: summary });
@@ -253,7 +264,7 @@ export async function updateSection(s: Session, id: string, section: string, val
 }
 
 export async function logGovernmentReveal(s: Session, id: string) {
-  demand(s, "people", "view");
+  demand(s, "view", "people", id);
   await employeeOf(pool, id);
   await audit(pool, { actorId: s.accountId, actorName: s.name, module: "People", action: "Viewed", target: "Government numbers", employeeNo: id, detail: "Revealed full numbers" });
 }
@@ -277,8 +288,8 @@ export async function storeFile(c: Db, s: Session, dataUrl: unknown, fileName: s
   if (!bytes.length) throw new UserError("That file is empty");
   if (bytes.length > maxBytes) throw new UserError(`That file is over ${Math.round(maxBytes / 1024 / 1024)} MB. Try a smaller one.`);
   const { rows: [f] } = await c.query(
-    `insert into files (storage_key, file_name, content_type, size_bytes, sha256, uploaded_by, content) values ('db:' || gen_random_uuid(), $1, $2, $3, encode(sha256($4), 'hex'), $5, $4) returning id`,
-    [fileName.slice(0, 200) || "file", m[1], bytes.length, bytes, s.accountId],
+    `insert into files (storage_key, file_name, content_type, size_bytes, sha256, uploaded_by, content) values ('db:' || gen_random_uuid(), $1, $2, $3, $4, $5, $6) returning id`,
+    [seal(fileName.slice(0, 200) || "file"), m[1], bytes.length, createHash("sha256").update(bytes).digest("hex"), s.accountId, sealBytes(bytes)],
   );
   return f.id as string;
 }
@@ -296,22 +307,22 @@ async function profileJson(db: Db, r: any) {
 
 /** One person's profile: anyone with People access, or the person themself. */
 export async function getProfile(s: Session, id: string) {
-  if (!(s.employeeNo === id || can(s, "people", "view") || can(s, "documents", "view"))) throw new UserError("You don't have access to do that.", 403);
+  if (!(s.employeeNo === id || can(s, "view", "people", id) || can(s, "view", "documents", id))) throw new UserError("You don't have access to do that.", 403);
   const r = (await pool.query(`select employee_id, birth_date, civil_status, photo_file_id from employees where employee_id = $1`, [id])).rows[0];
   return r ? profileJson(pool, r) : null;
 }
 
 export async function listProfiles(s: Session) {
-  demand(s, "people", "view");
+  demand(s, "view", "people");
   const { rows } = await pool.query(`select employee_id, birth_date, civil_status, photo_file_id from employees order by employee_id`);
-  return Promise.all(rows.map((r) => profileJson(pool, r)));
+  return Promise.all(seen(s, "people", rows, (r) => r.employee_id).map((r) => profileJson(pool, r)));
 }
 
 /** Birth date, civil status and dependents (HR); the photo (HR or the person themself). */
 export async function updateProfile(s: Session, id: string, body: any) {
   const self = s.employeeNo === id;
   const onlyPhoto = Object.keys(body ?? {}).every((k) => k === "photoDataUrl");
-  if (!(self && onlyPhoto)) demand(s, "people", "edit");
+  if (!(self && onlyPhoto)) demand(s, "edit", "people", id);
   return tx(async (c) => {
     const e = await employeeOf(c, id);
     if (body?.photoDataUrl !== undefined) {
@@ -343,15 +354,15 @@ export async function attachDocumentFile(s: Session, id: string, body: any) {
   return tx(async (c) => {
     const d = (await c.query(`select * from employee_documents where id::text = $1 for update`, [id])).rows[0];
     if (!d) throw new UserError("That document no longer exists", 404);
-    if (!(s.employeeNo && d.employee_id === s.employeeNo)) demand(s, "documents", "edit");
+    if (!(s.employeeNo && d.employee_id === s.employeeNo)) demand(s, "edit", "documents", d.employee_id);
     const fileId = await storeFile(c, s, body?.dataUrl, String(body?.fileName ?? "document"), /^(image\/(jpeg|png|webp)|application\/pdf)$/, 10 * 1024 * 1024);
-    await c.query(`update employee_documents set file_id = $2, file_name = $3 where id = $1`, [d.id, fileId, String(body?.fileName ?? "document").slice(0, 200)]);
+    await c.query(`update employee_documents set file_id = $2, file_name = $3 where id = $1`, [d.id, fileId, seal(String(body?.fileName ?? "document").slice(0, 200))]);
   });
 }
 
 /** Records that someone opened a person's 201 File (or part of it). */
 export async function logView(s: Session, id: string, target: string) {
-  if (!(can(s, "people", "view") || can(s, "documents", "view"))) throw new UserError("You don't have access to do that.", 403);
+  if (!(can(s, "view", "people", id) || can(s, "view", "documents", id))) throw new UserError("You don't have access to do that.", 403);
   await employeeOf(pool, id);
   await audit(pool, { actorId: s.accountId, actorName: s.name, module: "People", action: "Viewed", target: target || "201 File", employeeNo: id });
 }
@@ -359,7 +370,7 @@ export async function logView(s: Session, id: string, target: string) {
 // ---- Organization chart ----
 
 export async function setCompanyHead(s: Session, id: string) {
-  demand(s, "company", "edit");
+  demand(s, "edit", "orgChart");
   return tx(async (c) => {
     const e = await employeeOf(c, id);
     if (e.record_status === "SEPARATED") throw new UserError("Choose a current employee");
@@ -374,7 +385,7 @@ export async function setCompanyHead(s: Session, id: string) {
 
 /** Change who someone reports to. Blocks loops (reporting to someone who reports to them). */
 export async function setReportsTo(s: Session, id: string, supervisorId: string | null) {
-  demand(s, "company", "edit");
+  demand(s, "edit", "orgChart");
   return tx(async (c) => {
     const e = await employeeOf(c, id);
     if (e.record_status === "SEPARATED") throw new UserError("That employee no longer works here");
@@ -409,6 +420,7 @@ async function syncLicense(c: Db, documentId: string) {
   const d = (await c.query(`select * from employee_documents where id = $1`, [documentId])).rows[0];
   if (!d || d.document_type !== "Professional License" || !d.reference_no) return;
   const type = d.id_type?.trim() || "PRC license";
+  // The number is copied as stored (encrypted); both columns are read back with open().
   const existing = (await c.query(`select id from professional_licenses where employee_id = $1 order by expires_on desc nulls last limit 1`, [d.employee_id])).rows[0];
   if (existing) {
     await c.query(`update professional_licenses set license_type = $2, license_number = $3, expires_on = $4, cycle_end_date = coalesce($4, cycle_end_date) where id = $1`, [existing.id, type, d.reference_no, d.expires_on]);
@@ -425,7 +437,7 @@ export async function updateDocument(s: Session, id: string, action: any) {
     if (!d) throw new UserError("That document no longer exists", 404);
     // Employees upload their own documents and can withdraw one HR hasn't checked yet; everything else is HR's.
     const own = !!s.employeeNo && d.employee_id === s.employeeNo && (action?.kind === "upload" || action?.kind === "withdraw");
-    if (!own) demand(s, "documents", "edit");
+    if (!own) demand(s, "edit", "documents", d.employee_id);
     const log = (act: string, detail: string) => audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: act, target: d.document_type, employeeNo: d.employee_id, detail });
     const clearVerification = `verified_at = null, verified_by = null, verified_by_name = null`;
     switch (action?.kind) {
@@ -437,9 +449,9 @@ export async function updateDocument(s: Session, id: string, action: any) {
         if (action.expiresOn && daysUntil(action.expiresOn) < 0) throw new UserError("That document has already expired");
         await c.query(
           `update employee_documents set status = 'Submitted', file_name = $2, submitted_at = now(), reference_no = $3, expires_on = $4, ${clearVerification}, note = null where id = $1`,
-          [d.id, action.fileName, action.referenceNo?.trim() || null, action.expiresOn || null],
+          [d.id, seal(action.fileName), seal(action.referenceNo?.trim()), action.expiresOn || null],
         );
-        await log("Uploaded", d.file_name ? `Replaced the file with ${action.fileName}` : `Uploaded ${action.fileName}`);
+        await log("Uploaded", d.file_name ? "Replaced the file" : "Uploaded a file");
         break;
       }
       case "verify":
@@ -467,7 +479,7 @@ export async function updateDocument(s: Session, id: string, action: any) {
       case "details": {
         const expiresOn = action.expiresOn ? String(action.expiresOn) : null;
         if (expiresOn && !/^\d{4}-\d{2}-\d{2}$/.test(expiresOn)) throw new UserError("Enter the expiry date as a date");
-        await c.query(`update employee_documents set id_type = $2, reference_no = $3, expires_on = $4 where id = $1`, [d.id, action.idType?.trim() || null, action.referenceNo?.trim() || null, expiresOn]);
+        await c.query(`update employee_documents set id_type = $2, reference_no = $3, expires_on = $4 where id = $1`, [d.id, action.idType?.trim() || null, seal(action.referenceNo?.trim()), expiresOn]);
         await log("Edited", "Details updated");
         await syncLicense(c, d.id);
         break;

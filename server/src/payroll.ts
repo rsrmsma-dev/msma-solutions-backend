@@ -7,7 +7,7 @@
 
 import { BUILT_IN_RATES, rateProblem } from "../../src/lib/pay/rateRules";
 import type { Agency, RateVersion } from "../../src/lib/reports/statutory";
-import { audit, demand, type Session } from "./auth";
+import { audit, demand, scopeOf, type Session } from "./auth";
 import { pool, tx, UserError, type Db } from "./db";
 
 const AGENCIES: Agency[] = ["sss", "philhealth", "pagibig", "bir"];
@@ -27,7 +27,7 @@ export async function listRates() {
 }
 
 export async function saveRates(s: Session, agency: string, body: any) {
-  demand(s, "payroll", "edit");
+  demand(s, "create", "contributions");
   if (!AGENCIES.includes(agency as Agency)) throw new UserError("Unknown agency");
   const a = agency as Agency;
   const input = { effectiveFrom: String(body?.effectiveFrom ?? ""), source: String(body?.source ?? "").trim(), rates: body?.rates ?? {} };
@@ -49,7 +49,7 @@ export async function saveRates(s: Session, agency: string, body: any) {
 
 /** Removes a version that hasn't taken effect yet. Versions already in force stay on record. */
 export async function deleteRates(s: Session, agency: string, id: string) {
-  demand(s, "payroll", "edit");
+  demand(s, "delete", "contributions");
   return tx(async (c) => {
     const v = (await c.query(`select * from contribution_rate_versions where agency = $1 and id::text = $2`, [agency, id])).rows[0];
     if (!v) throw new UserError("That version no longer exists", 404);
@@ -135,19 +135,24 @@ async function saveLines(c: Db, runId: string, lines: any[]) {
   await c.query(`update payroll_runs set computed_at = now() where id = $1`, [runId]);
 }
 
+/** Whole runs are for those who work on payroll (Accounting, Super Admin); employees get their payslips. */
+const demandAllRuns = (s: Session) => {
+  if (scopeOf(s, "view", "payrollRuns") !== "all") throw new UserError("You don't have access to do that.", 403);
+};
+
 export async function listRuns(s: Session) {
-  demand(s, "payroll", "view");
+  demandAllRuns(s);
   const { rows } = await pool.query(`select * from payroll_runs order by period_from desc`);
   return Promise.all(rows.map((r) => runJson(pool, r)));
 }
 
 export async function getRun(s: Session, id: string) {
-  demand(s, "payroll", "view");
+  demandAllRuns(s);
   return runJson(pool, await runRow(pool, id));
 }
 
 export async function createRun(s: Session, body: any) {
-  demand(s, "payroll", "edit");
+  demand(s, "create", "payrollRuns");
   const label = String(body?.label ?? "").trim(), from = String(body?.from ?? ""), to = String(body?.to ?? "");
   if (!label || !DATE.test(from) || !DATE.test(to) || to < from) throw new UserError("Choose the cutoff");
   return tx(async (c) => {
@@ -172,7 +177,7 @@ async function draftRow(c: Db, id: string, lockedMessage: string) {
 
 /** Recomputed from the latest attendance (in the browser). */
 export async function refreshRun(s: Session, id: string, body: any) {
-  demand(s, "payroll", "edit");
+  demand(s, "edit", "payrollRuns");
   return tx(async (c) => {
     const r = await draftRow(c, id, "This run is approved and locked");
     await saveLines(c, r.id, await checkLines(c, body?.lines));
@@ -181,7 +186,7 @@ export async function refreshRun(s: Session, id: string, body: any) {
 }
 
 export async function addAdjustment(s: Session, id: string, body: any) {
-  demand(s, "payroll", "edit");
+  demand(s, "edit", "payrollRuns");
   const employeeId = String(body?.employeeId ?? "");
   const label = String(body?.label ?? "").trim(), reason = String(body?.reason ?? "").trim();
   const amount = Math.round(Number(body?.amount) * 100) / 100;
@@ -203,7 +208,7 @@ export async function addAdjustment(s: Session, id: string, body: any) {
 }
 
 export async function removeAdjustment(s: Session, id: string, adjustmentId: string, body: any) {
-  demand(s, "payroll", "edit");
+  demand(s, "edit", "payrollRuns");
   return tx(async (c) => {
     const r = await draftRow(c, id, "This run is approved and locked");
     const { rowCount } = await c.query(`delete from payroll_adjustments where payroll_run_id = $1 and id::text = $2`, [r.id, adjustmentId]);
@@ -214,9 +219,9 @@ export async function removeAdjustment(s: Session, id: string, adjustmentId: str
   });
 }
 
-/** Locks the run with the numbers as computed now, and releases the payslips. */
+/** Locks the run with the numbers as computed now, and releases the payslips. The final approval: Accounting or Super Admin. */
 export async function approveRun(s: Session, id: string, body: any) {
-  demand(s, "payroll", "edit");
+  demand(s, "final", "payrollRuns");
   return tx(async (c) => {
     const r = await draftRow(c, id, "This run is already approved");
     const lines = await checkLines(c, body?.lines);
@@ -229,7 +234,7 @@ export async function approveRun(s: Session, id: string, body: any) {
 }
 
 export async function deleteRun(s: Session, id: string) {
-  demand(s, "payroll", "edit");
+  demand(s, "delete", "payrollRuns");
   return tx(async (c) => {
     const r = await draftRow(c, id, "Approved runs stay on record");
     await c.query(`delete from payroll_runs where id = $1`, [r.id]);
