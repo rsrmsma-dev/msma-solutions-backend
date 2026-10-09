@@ -1,7 +1,7 @@
 # MSMA HRIS backend (HeyHR API)
 
 The API server and PostgreSQL database for the MSMA HRIS website (HeyHR). It covers
-sign-in and accounts (including employee self-registration), People / 201 File, Leave,
+sign-in and accounts (including employee self-registration and two-factor sign-in), People / 201 File, Leave,
 Timekeeping & attendance, Payroll and government contributions, Reimbursements and
 employee self-service.
 
@@ -49,7 +49,7 @@ Other scripts (in `server/`):
 
 ## Database
 
-- `database/schema.sql`: the whole schema (46 tables, migrations 001–013 included); every table and column is described,
+- `database/schema.sql`: the whole schema (46 tables, migrations 001–016 included); every table and column is described,
   so `\dt+` and `\d+` in psql show what each is for.
 - `database/DATA_DICTIONARY.md`: the same descriptions as a document.
 - `database/PSQL_CHEATSHEET.md`: commands for looking at the database.
@@ -59,9 +59,20 @@ Other scripts (in `server/`):
 
 ## Roles
 
-Six fixed roles: System Admin, Super Admin, HR, Approver, Accounting, Employee. What each may do
-is the access matrix in `src/lib/permissions.ts`, the same file the website reads, so pages and the
-API always agree. Approvers act on their team (the people whose supervisor they are).
+The website's six roles: System Admin, Super Admin, HR, Approver, Accounting, Employee. What each
+may open is the access matrix in `src/lib/permissions.ts`, the same file the website reads.
+Approvers act on their team (the people whose supervisor they are).
+
+Who may create which sign-ins is decided by the server (`server/src/hierarchy.ts`, see
+`server/ROLES.md`): System Admin (us) creates everyone, including **Admin** (the owner company, us:
+Super Admin's access, hidden from the client); Super Admin (the client) builds their own hierarchy;
+HR creates employee sign-ins only.
+
+## Self-registration
+
+HR adds the employee; the person registers on the sign-in page. When their name, email and mobile
+match, their sign-in is created (username = the part of the email before the @) with a password
+nobody knows; HR gives them a temporary one with Reset password. See `server/REGISTRATION.md`.
 
 ## Security notes
 

@@ -12,6 +12,8 @@ import { seedRates } from "./payroll.js";
 import { seedWorkflows } from "./admin.js";
 import { LIMITS, ROLE_DESCRIPTION, ROLE_LABEL, type RoleKey } from "../../src/lib/permissions";
 
+const ADMIN_DESCRIPTION = "The owner company (us). Super Admin's access across the system; created only by a System Admin and hidden from the client.";
+
 const BRANCHES = [
   { name: "Cebu HQ", code: "CEB", address: "8F Park Centrale Tower, Cebu IT Park, Lahug, Cebu City" },
   { name: "Manila", code: "MNL", address: "21F Zuellig Building, Makati Avenue, Makati City" },
@@ -36,9 +38,13 @@ const levelFor = (t: string) => (/^partner$/i.test(t) ? "Executive" : /director/
 const acronym = (t: string) => t.split(/\s+/).map((w) => w[0]).join("").toUpperCase();
 
 // The six fixed roles (src/lib/admin/store.ts DEFAULT_ROLES; names and descriptions from src/lib/permissions.ts).
-const ROLES = (["system_admin", "super_admin", "hr", "approver", "accounting", "employee"] as RoleKey[]).map((key) => ({
-  id: key.replace("_", "-"), key, name: ROLE_LABEL[key], description: ROLE_DESCRIPTION[key], workspace: LIMITS.workspace[key],
-}));
+const ROLES = [
+  ...(["system_admin", "super_admin", "hr", "approver", "accounting", "employee"] as RoleKey[]).map((key) => ({
+    id: key.replace("_", "-"), key: key as string, name: ROLE_LABEL[key], description: ROLE_DESCRIPTION[key], workspace: LIMITS.workspace[key],
+  })),
+  // Ours (the owner company): Super Admin's access, created only by a System Admin (server/src/hierarchy.ts).
+  { id: "admin", key: "admin", name: "Admin", description: ADMIN_DESCRIPTION, workspace: "admin" as const },
+];
 /** Starting sign-ins, one per role. `key` marks the ones created at setup before the six roles. Change the passwords after first sign-in. */
 const ACCOUNTS = [
   { key: "superadmin", username: "superadmin", password: "Heyhr-Super-2026!", name: "System Administrator", role: "super-admin" },

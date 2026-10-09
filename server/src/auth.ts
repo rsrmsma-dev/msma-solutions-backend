@@ -5,6 +5,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { hash, verify } from "@node-rs/argon2";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { pool, UserError, type Db } from "./db.js";
+import { matrixRole, type AccountRole } from "./hierarchy.js";
 import { can as allowed, canFor, scopeFor, visible, type Action, type Feature, type RoleKey, type Scope, type Who } from "../../src/lib/permissions";
 
 export const COOKIE = "heyhr_session";
@@ -15,8 +16,10 @@ export interface Session {
   name: string;
   username: string;
   roleId: string;
-  /** Which of the six roles (src/lib/permissions.ts). */
+  /** Which of the six roles the access table knows (src/lib/permissions.ts); Admin counts as Super Admin. */
   role: RoleKey | null;
+  /** The account's own role, Admin included (server/src/hierarchy.ts). */
+  accountRole: AccountRole | null;
   workspace: "employee" | "manager" | "admin";
   /** EMPLOYEE_ID of the linked employee, if any. */
   employeeNo?: string;
@@ -165,7 +168,7 @@ export async function loadSession(req: FastifyRequest): Promise<Session | undefi
   const team = r.employee_id
     ? (await pool.query(`select employee_id from employees where supervisor_id = $1 and record_status <> 'SEPARATED'`, [r.employee_id])).rows.map((x) => x.employee_id as string)
     : [];
-  return { accountId: r.id, name: r.display_name, username: r.username, roleId: r.role_id, role: r.role_key ?? null, workspace: r.workspace, employeeNo: r.employee_id ?? undefined, team, mustChangePassword: r.must_change_password };
+  return { accountId: r.id, name: r.display_name, username: r.username, roleId: r.role_id, role: matrixRole(r.role_key), accountRole: r.role_key ?? null, workspace: r.workspace, employeeNo: r.employee_id ?? undefined, team, mustChangePassword: r.must_change_password };
 }
 
 /** Fastify preHandler: 401 unless signed in. */

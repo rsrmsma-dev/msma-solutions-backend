@@ -5,6 +5,7 @@ import Fastify, { type FastifyReply } from "fastify";
 import { COOKIE, accountJson, requireSession, signIn, signOut, loadSession } from "./auth.js";
 import * as admin from "./admin.js";
 import * as mfa from "./mfa.js";
+import * as registration from "./registration.js";
 import * as corehr from "./corehr.js";
 import * as leave from "./leave.js";
 import * as tk from "./timekeeping.js";
@@ -124,8 +125,9 @@ app.post<{ Body: { code?: string } }>("/api/auth/mfa", async (req, reply) => {
   return r.ok;
 });
 
-// Employees HR already added create their own sign-in (no session needed).
-app.post<{ Body: any }>("/api/auth/register", (req) => admin.registerAccount(req.ip, req.body));
+// The Register form (no session): when name, mobile and email match an employee HR added, their sign-in
+// is created; HR then gives them a temporary password (Reset password in Users).
+app.post<{ Body: any }>("/api/auth/register", (req) => registration.register(req.ip, req.body));
 
 app.post<{ Body: { reason?: "manual" | "idle" } }>("/api/auth/logout", async (req, reply) => {
   await signOut(req.cookies[COOKIE], req.body?.reason === "idle" ? "idle" : "manual");
@@ -282,8 +284,8 @@ app.register(async (r) => {
     admin.changeOwnPassword(req.session!, String(req.body?.currentPassword ?? ""), String(req.body?.newPassword ?? "")));
 
   // Every signed-in user needs the role definitions to know what they can open.
-  r.get("/api/roles", () => admin.listRoles(false));
-  r.get("/api/admin/roles", () => admin.listRoles(true));
+  r.get("/api/roles", (req) => admin.listRoles(false, undefined, req.session!));
+  r.get("/api/admin/roles", (req) => admin.listRoles(true, undefined, req.session!));
   r.post<{ Body: any }>("/api/admin/roles", (req) => admin.saveRole(req.session!, req.body ?? {}));
   r.delete<{ Params: { id: string } }>("/api/admin/roles/:id", async (req) => (await admin.deleteRole(req.session!, req.params.id), { ok: true }));
 

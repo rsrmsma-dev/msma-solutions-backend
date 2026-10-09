@@ -586,10 +586,10 @@ CREATE TABLE subscriptions (
   updated_by uuid
 );
 
--- The six fixed roles. What each may do is the access matrix in the app (src/lib/permissions.ts).
+-- The fixed roles: the website's six (access matrix in src/lib/permissions.ts) plus Admin, the owner company's own role with Super Admin's access. Who may create which is in server/src/hierarchy.ts.
 CREATE TABLE roles (
   id text PRIMARY KEY,
-  role_key text NOT NULL UNIQUE CHECK (role_key IN ('system_admin', 'super_admin', 'hr', 'approver', 'accounting', 'employee')),
+  role_key text NOT NULL UNIQUE CHECK (role_key IN ('system_admin', 'admin', 'super_admin', 'hr', 'approver', 'accounting', 'employee')),
   name text NOT NULL UNIQUE,
   description text NOT NULL,
   workspace text NOT NULL CHECK (workspace IN ('employee', 'manager', 'admin')),
@@ -1145,9 +1145,9 @@ COMMENT ON COLUMN subscriptions.created_at IS 'When the row was created.';
 COMMENT ON COLUMN subscriptions.created_by IS 'Account that set it up.';
 COMMENT ON COLUMN subscriptions.updated_at IS 'Last change.';
 COMMENT ON COLUMN subscriptions.updated_by IS 'Account that made the last change.';
-COMMENT ON TABLE roles IS 'The six fixed roles. What each may do is the access matrix in the app (src/lib/permissions.ts).';
+COMMENT ON TABLE roles IS 'The fixed roles: the website''s six (access matrix in src/lib/permissions.ts) plus Admin, the owner company''s own role with Super Admin''s access. Who may create which is in server/src/hierarchy.ts.';
 COMMENT ON COLUMN roles.id IS 'Role id, e.g. super-admin, hr.';
-COMMENT ON COLUMN roles.role_key IS 'Which of the six roles, as the access matrix names it.';
+COMMENT ON COLUMN roles.role_key IS 'Which role: the access matrix''s six, or admin (ours).';
 COMMENT ON COLUMN roles.name IS 'Display name.';
 COMMENT ON COLUMN roles.description IS 'What the role is for.';
 COMMENT ON COLUMN roles.workspace IS 'Workspace it signs into.';
@@ -1436,5 +1436,5 @@ CREATE INDEX ON leave_requests (employee_id, date_from, date_to);
 CREATE INDEX ON audit_log (employee_id, occurred_at DESC);
 CREATE INDEX ON employee_documents (expires_on) WHERE expires_on IS NOT NULL;
 
-INSERT INTO schema_migrations (version) VALUES ('001_leave'), ('002_timekeeping'), ('003_payroll'), ('004_files'), ('005_comments'), ('006_roles_settings'), ('007_subscriptions'), ('008_audit_append_only'), ('009_encrypt_government_numbers'), ('010_encrypt_document_numbers'), ('011_encrypt_files_and_reasons'), ('012_encrypt_file_names'), ('013_mfa');
+INSERT INTO schema_migrations (version) VALUES ('001_leave'), ('002_timekeeping'), ('003_payroll'), ('004_files'), ('005_comments'), ('006_roles_settings'), ('007_subscriptions'), ('008_audit_append_only'), ('009_encrypt_government_numbers'), ('010_encrypt_document_numbers'), ('011_encrypt_files_and_reasons'), ('012_encrypt_file_names'), ('013_mfa'), ('014_registration_requests'), ('015_admin_role'), ('016_registration_creates_sign_in');
 COMMIT;

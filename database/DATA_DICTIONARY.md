@@ -689,12 +689,12 @@ The company's HRIS plan (SaaS): plan, seat limit and billing period. One row per
 
 ### `roles`
 
-The six fixed roles. What each may do is the access matrix in the app (src/lib/permissions.ts).
+The fixed roles: the website's six (access matrix in src/lib/permissions.ts) plus Admin, the owner company's own role with Super Admin's access. Who may create which is in server/src/hierarchy.ts.
 
 | Column | Type | Null | Key | Default | Description |
 |---|---|---|---|---|---|
 | `id` | text | No | PK |  | Role id, e.g. super-admin, hr. |
-| `role_key` | text | No | UQ |  | Which of the six roles, as the access matrix names it. Allowed: `system_admin`, `super_admin`, `hr`, `approver`, `accounting`, `employee`. |
+| `role_key` | text | No | UQ |  | Which role: the access matrix's six, or admin (ours). Allowed: `system_admin`, `admin`, `super_admin`, `hr`, `approver`, `accounting`, `employee`. |
 | `name` | text | No | UQ |  | Display name. |
 | `description` | text | No |  |  | What the role is for. |
 | `workspace` | text | No |  |  | Workspace it signs into. Allowed: `employee`, `manager`, `admin`. |

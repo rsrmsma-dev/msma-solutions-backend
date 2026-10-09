@@ -499,9 +499,9 @@ DOMAINS = [
      ("updated_at", "timestamptz", "NN D:now()", "Last change."),
      acct("updated_by", "Account that made the last change."),
    ]),
-   ("roles", "The six fixed roles. What each may do is the access matrix in the app (src/lib/permissions.ts).", [
+   ("roles", "The fixed roles: the website's six (access matrix in src/lib/permissions.ts) plus Admin, the owner company's own role with Super Admin's access. Who may create which is in server/src/hierarchy.ts.", [
      ("id", "text", "PK", "Role id, e.g. super-admin, hr."),
-     ("role_key", "text", "NN UQ", "Which of the six roles, as the access matrix names it.", ["system_admin", "super_admin", "hr", "approver", "accounting", "employee"]),
+     ("role_key", "text", "NN UQ", "Which role: the access matrix's six, or admin (ours).", ["system_admin", "admin", "super_admin", "hr", "approver", "accounting", "employee"]),
      ("name", "text", "NN UQ", "Display name."),
      ("description", "text", "NN", "What the role is for."),
      ("workspace", "text", "NN", "Workspace it signs into.", ["employee", "manager", "admin"]),

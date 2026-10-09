@@ -7,16 +7,21 @@ import { createHash, randomInt } from "node:crypto";
 import { verify } from "@node-rs/argon2";
 import { accountJson, audit, demand, hashPassword, type Session } from "./auth";
 import { clean, pool, tx, UserError, type Db } from "./db";
-import { LIMITS, type RoleKey } from "../../src/lib/permissions";
+import { LIMITS } from "../../src/lib/permissions";
+import { managesAccounts, mayAssign as allowedToGive, OUR_ROLES, VISIBLE, type AccountRole } from "./hierarchy.js";
 import { seal, sealBytes } from "./crypto";
 import { turnOff as turnOffMfa } from "./mfa";
 
 const log = (db: Db, s: Session, action: string, target: string, detail = "") =>
   audit(db, { actorId: s.accountId, actorName: s.name, module: "Administration", action, target, detail });
 
-/** May the signed-in person give this role, or change accounts that hold it? */
-const mayAssign = (s: Session, key: RoleKey | null | undefined) => !!key && LIMITS.assignableRoles[s.role ?? "employee"].includes(key);
-const roleKey = async (db: Db, roleId: string): Promise<RoleKey | undefined> => (await db.query(`select role_key from roles where id = $1`, [roleId])).rows[0]?.role_key;
+/** May the signed-in person give this role, or change accounts that hold it? (server/src/hierarchy.ts) */
+const mayAssign = (s: Session, key: AccountRole | null | undefined) => allowedToGive(s.accountRole, key);
+/** Only roles that manage some accounts may use the account screens at all. */
+const demandAccounts = (s: Session) => {
+  if (!managesAccounts(s.accountRole)) throw new UserError("You don't have access to do that.", 403);
+};
+const roleKey = async (db: Db, roleId: string): Promise<AccountRole | undefined> => (await db.query(`select role_key from roles where id = $1`, [roleId])).rows[0]?.role_key;
 const activeSuperAdmins = async (db: Db) =>
   (await db.query(`select count(*)::int as n from user_accounts a join roles r on r.id = a.role_id where a.status = 'active' and r.is_super_admin`)).rows[0].n as number;
 
@@ -36,14 +41,18 @@ async function tempPassword(db: Db) {
 // ---- Roles ----
 
 /** The six fixed roles. What each may do is the access matrix (src/lib/permissions.ts); `access` is kept empty for older screens. */
-export async function listRoles(withCounts: boolean, db: Db = pool) {
+export async function listRoles(withCounts: boolean, db: Db = pool, s?: Session) {
   const none = { people: "none", company: "none", documents: "none", timekeeping: "none", leave: "none", reimbursements: "none", reports: "none", payroll: "none", administration: "none" };
   const { rows } = await db.query(
     `select r.id, r.role_key as key, r.name, r.description, r.workspace, r.is_built_in as "builtIn", r.is_super_admin as "superAdmin",
             (select count(*)::int from user_accounts a where a.role_id = r.id) as users
-       from roles r order by array_position(array['system_admin','super_admin','hr','approver','accounting','employee'], r.role_key)`,
+       from roles r order by array_position(array['system_admin','admin','super_admin','hr','approver','accounting','employee'], r.role_key)`,
   );
-  return rows.map((r) => {
+  // Our own roles stay out of the client's lists. The website knows six roles, so Admin is sent
+  // as a Super Admin (same access); the server still tells them apart.
+  const ours = !!s?.accountRole && OUR_ROLES.includes(s.accountRole);
+  return rows.filter((r) => ours || !OUR_ROLES.includes(r.key) || r.key === s?.accountRole).map((r) => {
+    if (r.key === "admin") r.key = "super_admin";
     const out = { ...r, access: none, ...(r.superAdmin ? {} : { superAdmin: undefined }) };
     if (!withCounts) delete out.users;
     return clean(out);
@@ -61,7 +70,7 @@ export async function deleteRole(_s: Session, _id: string): Promise<never> {
 // ---- Accounts ----
 
 export async function listAccounts(s: Session) {
-  demand(s, "view", "roleAssignment");
+  demandAccounts(s);
   const { rows } = await pool.query(
     `select a.id, a.display_name as name, a.username, a.employee_id as "employeeId", a.role_id as "roleId", a.status,
             a.must_change_password as "mustChangePassword", a.last_sign_in_at as "lastSignIn", a.failed_attempts as "failedAttempts",
@@ -69,16 +78,17 @@ export async function listAccounts(s: Session) {
             nullif(concat_ws(' ', e.first_name, e.last_name), '') as "employeeName", coalesce(a.locked_until > now(), false) as locked,
             (a.mfa_enabled_at is not null) as "mfaEnabled"
        from user_accounts a left join roles r on r.id = a.role_id left join employees e on e.employee_id = a.employee_id
-      where $1::text is distinct from 'system_admin' or r.role_key = 'super_admin'
+      where r.role_key = any($1) or a.id = $2
       order by a.display_name`,
-    [s.role],
+    [VISIBLE[s.accountRole ?? "employee"], s.accountId],
   );
-  // A System Admin sees only Super Admin accounts (no client staff).
+  // Each role sees the accounts it may manage (server/src/hierarchy.ts); ours stay hidden from the client.
+  // Always their own too: the website looks up the signed-in person's role in this list.
   return clean(rows);
 }
 
 export async function createAccount(s: Session, input: { name?: string; username?: string; roleId?: string; employeeId?: string }) {
-  demand(s, "create", "roleAssignment");
+  demandAccounts(s);
   const name = String(input.name ?? "").trim();
   const username = String(input.username ?? "").trim().toLowerCase();
   if (!name) throw new UserError("Enter the person's name");
@@ -95,7 +105,7 @@ export async function createAccount(s: Session, input: { name?: string; username
       const holder = (await c.query(`select username from user_accounts where employee_id = $1`, [employeeId])).rows[0];
       if (holder) throw new UserError(`This person already has an account (username ${holder.username}).`);
     }
-    if (role.role_key !== "system_admin") await assertSeatFree(c);
+    if (!OUR_ROLES.includes(role.role_key)) await assertSeatFree(c);
     const password = await tempPassword(c);
     await c.query(
       `insert into user_accounts (username, display_name, password_hash, employee_id, role_id, must_change_password) values ($1, $2, $3, $4, $5, true)`,
@@ -121,13 +131,13 @@ const accountRow = async (c: Db, s: Session, id: string) => {
 };
 
 export async function setAccountRole(s: Session, id: string, roleId: string) {
-  demand(s, "edit", "roleAssignment");
+  demandAccounts(s);
   return tx(async (c) => {
     const a = await accountRow(c, s, id);
     const role = (await c.query(`select * from roles where id = $1`, [roleId])).rows[0];
     if (!role) throw new UserError("Choose a role");
     if (!mayAssign(s, role.role_key)) throw new UserError("You can't give or change that role.", 403);
-    if ((await roleKey(c, a.role_id)) === "system_admin" && role.role_key !== "system_admin") await assertSeatFree(c);
+    if (OUR_ROLES.includes((await roleKey(c, a.role_id))!) && !OUR_ROLES.includes(role.role_key)) await assertSeatFree(c);
     const before = (await c.query(`select name from roles where id = $1`, [a.role_id])).rows[0]?.name ?? "None";
     await c.query(`update user_accounts set role_id = $2 where id = $1`, [a.id, roleId]);
     await guard(c, s, a);
@@ -136,7 +146,7 @@ export async function setAccountRole(s: Session, id: string, roleId: string) {
 }
 
 export async function setAccountStatus(s: Session, id: string, status: string) {
-  demand(s, "edit", "roleAssignment");
+  demandAccounts(s);
   if (status !== "active" && status !== "disabled") throw new UserError("Unknown status");
   return tx(async (c) => {
     const a = await accountRow(c, s, id);
@@ -149,7 +159,7 @@ export async function setAccountStatus(s: Session, id: string, status: string) {
 }
 
 export async function unlockAccount(s: Session, id: string) {
-  demand(s, "edit", "roleAssignment");
+  demandAccounts(s);
   return tx(async (c) => {
     const a = await accountRow(c, s, id);
     await c.query(`update user_accounts set locked_until = null, failed_attempts = 0 where id = $1`, [a.id]);
@@ -158,7 +168,7 @@ export async function unlockAccount(s: Session, id: string) {
 }
 
 export async function resetPassword(s: Session, id: string) {
-  demand(s, "edit", "roleAssignment");
+  demandAccounts(s);
   return tx(async (c) => {
     const a = await accountRow(c, s, id);
     const password = await tempPassword(c);
@@ -172,7 +182,7 @@ export async function resetPassword(s: Session, id: string) {
 
 /** For someone who lost their phone: turns their two-factor sign-in off and signs them out everywhere. */
 export async function resetMfa(s: Session, id: string) {
-  demand(s, "edit", "roleAssignment");
+  demandAccounts(s);
   return tx(async (c) => {
     const a = await accountRow(c, s, id);
     if (a.id === s.accountId) throw new UserError("Turn off your own two-factor sign-in in Settings › Security.");
@@ -290,9 +300,9 @@ async function currentSubscription(db: Db) {
   return (await db.query(`select * from subscriptions where status in ('trial', 'active', 'past_due') order by starts_on desc, created_at desc limit 1`)).rows[0];
 }
 
-/** Seats in use: every client account, active or turned off. System Admin accounts (our team) don't count. */
+/** Seats in use: every client account, active or turned off. Our System Admin and Admin accounts don't count. */
 async function seatsUsed(db: Db) {
-  return (await db.query(`select count(*)::int as n from user_accounts a join roles r on r.id = a.role_id where r.role_key <> 'system_admin'`)).rows[0].n as number;
+  return (await db.query(`select count(*)::int as n from user_accounts a join roles r on r.id = a.role_id where r.role_key <> all($1)`, [OUR_ROLES])).rows[0].n as number;
 }
 
 /** Refuses a new client account when the plan's seats are all taken. Runs inside the account's transaction. */
@@ -374,54 +384,6 @@ export async function listAdminAudit(s: Session) {
     [modules],
   );
   return rows;
-}
-
-// ---- Self-registration ----
-
-/** Slows down guessing: per address, at most this many tries in the window. */
-const REGISTER_TRIES = 8;
-const REGISTER_WINDOW_MS = 15 * 60_000;
-const registerTries = new Map<string, number[]>();
-
-/**
- * An employee HR already added creates their own sign-in. They prove who they are with
- * the work email and birth date on their 201 File; the account is linked to that record.
- */
-export async function registerAccount(ip: string, body: any) {
-  const now = Date.now();
-  const recent = (registerTries.get(ip) ?? []).filter((t) => now - t < REGISTER_WINDOW_MS);
-  if (recent.length >= REGISTER_TRIES) throw new UserError("Too many tries. Wait 15 minutes, or ask HR to create your sign-in.", 429);
-  registerTries.set(ip, [...recent, now]);
-
-  const email = String(body?.workEmail ?? "").trim().toLowerCase();
-  const birthDate = String(body?.birthDate ?? "");
-  const username = String(body?.username ?? "").trim().toLowerCase();
-  const password = String(body?.password ?? "");
-  if (!email || !/^\d{4}-\d{2}-\d{2}$/.test(birthDate)) throw new UserError("Enter your work email and birth date");
-  if (!/^[a-z0-9._-]{3,30}$/.test(username)) throw new UserError("Username: 3 to 30 letters, numbers, dots or dashes, no spaces");
-  const min = (await settingsRow(pool))?.min_password_length ?? 8;
-  if (password.length < min) throw new UserError(`Use at least ${min} characters for your password.`);
-  if (password.toLowerCase().includes(username)) throw new UserError("Don't use your username in your password.");
-
-  return tx(async (c) => {
-    const e = (await c.query(
-      `select employee_id, first_name, last_name from employees where lower(email) = $1 and birth_date = $2 and record_status <> 'SEPARATED' for update`,
-      [email, birthDate],
-    )).rows[0];
-    // Same message whichever part didn't match, so the form can't be used to find out who works here.
-    if (!e) throw new UserError("We couldn't match that work email and birth date to an employee record. Check both, or ask HR.");
-    if ((await c.query(`select 1 from user_accounts where employee_id = $1`, [e.employee_id])).rowCount) throw new UserError("You already have a sign-in. Use it to sign in, or ask HR to reset your password.");
-    if ((await c.query(`select 1 from user_accounts where lower(username) = $1`, [username])).rowCount) throw new UserError("That username is taken. Try another.");
-    const name = `${e.first_name} ${e.last_name}`;
-    await assertSeatFree(c);
-    await c.query(
-      `insert into user_accounts (username, display_name, password_hash, employee_id, role_id) values ($1, $2, $3, $4, 'employee')`,
-      [username, name, await hashPassword(password), e.employee_id],
-    );
-    await audit(c, { actorName: name, module: "Sign-in", action: "Registered", target: username, employeeNo: e.employee_id, detail: "Created own sign-in with work email and birth date" });
-    registerTries.delete(ip);
-    return { username, name };
-  });
 }
 
 // ---- Approval workflows ----

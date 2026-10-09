@@ -96,9 +96,16 @@ export async function loadState(s: Session) {
     pool.query(`select id::text, employee_id as "employeeId", actor_name as actor, action, target as section, coalesce(detail, '') as summary, occurred_at as at
                   from audit_log where module = 'People' and employee_id is not null and ($1 or employee_id = any($2)) order by occurred_at desc limit 5000`, [full, scope === "all" ? [] : scope]),
   ]);
-  // Roles with no People access at all (System Admin: our team) see no client employees.
+  // Roles with no People access (System Admin: our team) see only names and IDs, to link sign-ins.
   const noPeople = scopeOf(s, "view", "people") === null && !me;
-  const emps = (noPeople ? [] : employees.rows).map((r) => {
+  const namesOnly = noPeople && s.accountRole === "system_admin";
+  const emps = (noPeople && !namesOnly ? [] : employees.rows).map((r) => {
+    if (namesOnly) {
+      const e = employeeJson(r);
+      return { ...e, personal: { firstName: e.personal.firstName, middleName: e.personal.middleName, lastName: e.personal.lastName, suffix: e.personal.suffix, birthDate: "", sex: "", civilStatus: "", nationality: "" },
+        contact: { workEmail: "", personalEmail: "", mobile: "", address: "", city: "", province: "", emergencyName: "", emergencyRelationship: "", emergencyPhone: "" },
+        government: { sss: "", philhealth: "", pagibig: "", tin: "" }, job: { ...e.job, monthlySalary: 0 } };
+    }
     const e = employeeJson(r);
     // Without People access, other people's records show only what a directory would.
     if (isFull(e.id)) return e;
