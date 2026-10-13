@@ -1,6 +1,6 @@
 # HeyHR data dictionary
 
-PostgreSQL schema for the HRIS: 47 tables in 7 areas. The DDL is in [`schema.sql`](schema.sql).
+PostgreSQL schema for the HRIS: 57 tables in 7 areas. The DDL is in [`schema.sql`](schema.sql).
 
 Conventions: `uuid` primary keys; money is `numeric(12,2)` in PHP; times are `timestamptz`; allowed values are enforced with `CHECK`. Computed figures (leave balances, daily attendance results, compliance status) are not stored.
 
@@ -35,6 +35,13 @@ Single row of company-wide settings: identity, sign-in security, working time an
 | `work_end` | time | No |  | `'17:30'` | Usual end of the working day. |
 | `fiscal_year_start_month` | smallint | No |  | `1` | Month the fiscal year starts, 1 = January. |
 | `retention_months` | smallint | No |  | `0` | Keep records this many months after separation (0 = keep everything). |
+| `leave_half_days` | boolean | No |  | `true` | People may file half a day of leave (Settings > Time off & leave). |
+| `leave_negative_balance` | boolean | No |  | `false` | People may file leave beyond their remaining credits. |
+| `leave_default_carry_over` | smallint | No |  | `0` | Carry-over limit (days) pre-filled for new leave types. |
+| `leave_accrual` | text | No |  | `'yearly'` | How leave credits are granted; only yearly is calculated today. Allowed: `yearly`, `monthly`, `per-payroll`. |
+| `overtime_threshold_minutes` | smallint | No |  | `0` | Extra time after a shift shorter than this isn't overtime (Settings > Scheduling). |
+| `default_break_minutes` | smallint | No |  | `60` | Lunch break pre-filled for new shifts. |
+| `schedule_publish_lead_days` | smallint | No |  | `7` | How many days ahead schedules are published; stored for when there is a publishing step. |
 
 ### `org_units`
 
@@ -79,6 +86,50 @@ Philippine regular and special non-working days, by proclamation.
 | `holiday_type` | text | No |  |  | Regular holidays pay 200%; special days 130%. Allowed: `regular`, `special`. |
 | `source` | text | No |  |  | Proclamation number or reference. |
 
+### `holiday_rules`
+
+Holidays HR added on the Holiday calendar, or as company holidays in Settings: proclaimed and local holidays, every year or one year only. The national holidays and the movable ones (Holy Week, National Heroes Day, Chinese New Year) are built into the app.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `name` | text | No |  |  | e.g. Eid'l Fitr, Cebu City Charter Day. |
+| `holiday_type` | text | No |  |  | Regular holidays pay 200%; special days 130%. Allowed: `regular`, `special`. |
+| `repeat_kind` | text | No |  |  | Every year on the same date, or one year only. Allowed: `fixed`, `once`. |
+| `repeat_month` | smallint | Yes |  |  | Month (1-12), for a holiday every year. |
+| `repeat_day` | smallint | Yes |  |  | Day of the month, for a holiday every year. |
+| `once_date` | date | Yes |  |  | The date, for a one-year holiday. |
+| `source` | text | No |  |  | Proclamation or ordinance; Company for company holidays added in Settings. |
+| `created_by` | uuid | Yes | FK → user_accounts |  | Who added it. |
+| `created_by_name` | text | No |  |  | Name of who added it, kept if the account goes. |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
+
+### `holiday_rule_branches`
+
+Offices a local holiday applies to. No rows means every office.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `holiday_rule_id` | uuid | No | PK, FK → holiday_rules |  | The holiday. |
+| `branch_id` | uuid | No | PK, FK → org_units |  | Office it applies to. |
+
+### `holiday_changes`
+
+One-year changes from a proclamation: a holiday moved to another date, or cancelled, that year.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `builtin_rule_id` | text | Yes |  |  | Built-in holiday it changes (the app's id, e.g. national-heroes-day). |
+| `holiday_rule_id` | uuid | Yes | FK → holiday_rules |  | Holiday HR added that it changes. |
+| `year` | smallint | No |  |  | The year it applies to. |
+| `change_kind` | text | No |  |  | Moved or cancelled that year. Allowed: `move`, `cancel`. |
+| `new_date` | date | Yes |  |  | The new date, when moved. |
+| `source` | text | No |  |  | Proclamation that changes it. |
+| `changed_by` | uuid | Yes | FK → user_accounts |  | Who recorded it. |
+| `changed_by_name` | text | No |  |  | Name of who recorded it, kept if the account goes. |
+| `changed_at` | timestamptz | No |  | `now()` | When it was recorded. |
+
 ## People & 201 File
 
 The employee master record and everything kept in the 201 File: dependents, documents, job history, licenses, benefits and separation.
@@ -94,12 +145,12 @@ The employee master record (201 File core). Fields marked BRD follow the New Emp
 | `first_name` | varchar(50) | No |  |  | BRD. Given name. Letters only. |
 | `middle_name` | varchar(50) | Yes |  |  | BRD. Middle name. Letters only. |
 | `suffix` | varchar(10) | Yes |  |  | Jr., Sr., III. |
-| `birth_date` | date | No |  |  | BRD. Date of birth. Age must be 18 or older (checked by trigger). |
-| `sex` | char(1) | No |  |  | BRD. Gender. From the allowed values only. Allowed: `M`, `F`. |
-| `civil_status` | varchar(10) | No |  |  | BRD. Marital status. From the allowed values only. Allowed: `SINGLE`, `MARRIED`, `WIDOWED`, `SEPARATED`. |
-| `mobile_no` | varchar(11) | No | UQ |  | BRD. Mobile number, 11 digits: 09XXXXXXXXX. Unique. |
-| `email` | varchar(100) | No | UQ |  | BRD. Email address (work). Valid email format. Unique. |
-| `date_hired` | date | No |  |  | BRD. First day of employment. Not more than 30 days in the future (checked by trigger). |
+| `birth_date` | date | Yes |  |  | BRD. Date of birth. Age must be 18 or older (checked by trigger). Blank until filled in for a record made by Add user. |
+| `sex` | char(1) | Yes |  |  | BRD. Gender. From the allowed values only. Blank until filled in for a record made by Add user. Allowed: `M`, `F`. |
+| `civil_status` | varchar(10) | Yes |  |  | BRD. Marital status. From the allowed values only. Blank until filled in for a record made by Add user. Allowed: `SINGLE`, `MARRIED`, `WIDOWED`, `SEPARATED`. |
+| `mobile_no` | varchar(11) | Yes | UQ |  | BRD. Mobile number, 11 digits: 09XXXXXXXXX. Unique. Blank until filled in for a record made by Add user. |
+| `email` | varchar(100) | Yes | UQ |  | BRD. Email address (work). Valid email format. Unique. Blank until filled in for a record made by Add user. |
+| `date_hired` | date | Yes |  |  | BRD. First day of employment. Not more than 30 days in the future (checked by trigger). Blank until filled in for a record made by Add user (leave earned by the month and service-based leave wait for it). |
 | `employment_status` | varchar(12) | No |  | `'PROBATIONARY'` | BRD. Employment type. Allowed: `PROBATIONARY`, `REGULAR`, `FIXED_TERM`. |
 | `tin` | text | Yes |  |  | BRD. Tax Identification Number, encrypted by the app (AES-256-GCM). Required before first payroll. |
 | `sss_no` | text | Yes |  |  | BRD. SSS number, encrypted by the app (AES-256-GCM). Required before first payroll. |
@@ -109,7 +160,10 @@ The employee master record (201 File core). Fields marked BRD follow the New Emp
 | `sss_no_hash` | text | Yes | UQ |  | Fingerprint of the SSS number (HMAC-SHA256), so no two employees share one. |
 | `philhealth_no_hash` | text | Yes | UQ |  | Fingerprint of the PhilHealth number (HMAC-SHA256), so no two employees share one. |
 | `pagibig_no_hash` | text | Yes | UQ |  | Fingerprint of the Pag-IBIG MID (HMAC-SHA256), so no two employees share one. |
-| `basic_rate` | numeric(12,2) | No |  |  | BRD. Basic monthly salary in PHP; must be > 0. Restricted to HR and Payroll. |
+| `bank_name` | text | Yes |  |  | Bank (or e-wallet) take-home pay is sent to. |
+| `bank_account_name` | text | Yes |  |  | Name on the account. |
+| `bank_account_no` | text | Yes |  |  | Account number, encrypted by the app (AES-256-GCM). |
+| `basic_rate` | numeric(12,2) | Yes |  |  | BRD. Basic monthly salary in PHP; must be > 0. Restricted to HR and Payroll. Blank until filled in for a record made by Add user; payroll runs and final pay leave the person out until then. |
 | `nationality` | varchar(50) | No |  | `'Filipino'` | Nationality. |
 | `photo_file_id` | uuid | Yes | FK → files |  | ID photo. |
 | `personal_email` | varchar(100) | Yes |  |  | Personal email. |
@@ -381,6 +435,7 @@ Every time-in and time-out. Never deleted; HR sets bad ones aside.
 | `confirmed_by` | uuid | Yes | FK → user_accounts |  | HR looked at a flagged punch and kept it. |
 | `confirmed_by_name` | text | Yes |  |  | Name of who kept it. |
 | `confirmed_at` | timestamptz | Yes |  |  | When. |
+| `location` | text | Yes |  |  | Where a clock-in from home was made (the phone's GPS: latitude, longitude, accuracy in metres) or why it couldn't be had, as JSON encrypted by the app (AES-256-GCM). Only HR, the person's approver and the person may read it. |
 
 ### `time_requests`
 
@@ -424,6 +479,16 @@ Employee asks HR to add or correct a time-in/out the device missed.
 | `decided_by_name` | text | Yes |  |  | Name of who decided, kept if the account goes. |
 | `decided_at` | timestamptz | Yes |  |  | When it was decided. |
 | `decision_note` | text | Yes |  |  | Note from the approver to the employee. |
+
+### `work_from_home_days`
+
+Days an employee switched to working from home themselves (their manager is told). They clock in with a face scan.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `employee_id` | varchar(20) | No | PK, FK → employees |  | Who works from home. |
+| `work_date` | date | No | PK |  | The day. |
+| `declared_at` | timestamptz | No |  | `now()` | When they switched. |
 
 ### `remote_work_days`
 
@@ -633,6 +698,50 @@ Additions or deductions to one employee's pay in a run.
 | `is_taxable` | boolean | No |  | `false` | Taxable items go into gross before tax. |
 | `reason` | text | No |  |  | Why. |
 | `reimbursement_claim_id` | uuid | Yes | FK → reimbursement_claims |  | Claim being paid, if any. |
+| `loan_id` | uuid | Yes | FK → loans |  | Loan whose installment this is, if any. |
+| `is_automatic` | boolean | No |  | `false` | Added by payroll itself (a loan installment or an approved reimbursement), not by hand. |
+
+### `loans`
+
+Loans and other recurring deductions (SSS and Pag-IBIG loans, cash advances, company loans). Each payroll run deducts the installment until the balance is zero; final pay deducts what's left.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `employee_id` | varchar(20) | No | FK → employees |  | Who repays it. |
+| `kind` | text | No |  |  | Kind of loan or deduction. Allowed: `SSS salary loan`, `SSS calamity loan`, `Pag-IBIG multi-purpose loan`, `Pag-IBIG calamity loan`, `Cash advance`, `Company loan`, `Other deduction`. |
+| `reference` | text | No |  |  | The SSS/Pag-IBIG loan number, or what an Other deduction is for; encrypted by the app (AES-256-GCM). |
+| `principal` | numeric(12,2) | No |  |  | The total to deduct. |
+| `installment` | numeric(12,2) | No |  |  | Taken from each cutoff's pay until the balance is zero. |
+| `start_date` | date | No |  |  | First cutoff it's deducted from (any date inside it). |
+| `status` | text | No |  | `'active'` | Running, stopped (no more deductions, e.g. paid outside payroll) or settled (closed in final pay). Allowed: `active`, `stopped`, `settled`. |
+| `note` | text | Yes |  |  | Note, or why the deductions stopped; encrypted by the app (AES-256-GCM). |
+| `created_by` | uuid | Yes | FK → user_accounts |  | Who added it. |
+| `created_by_name` | text | No |  |  | Name of who added it, kept if the account goes. |
+| `created_at` | timestamptz | No |  | `now()` | When added. |
+| `closed_by` | uuid | Yes | FK → user_accounts |  | Who stopped or settled it. |
+| `closed_by_name` | text | Yes |  |  | Name of who closed it. |
+| `closed_at` | timestamptz | Yes |  |  | When it was stopped or settled. |
+
+### `final_pay_cases`
+
+Final pay (back pay) for someone leaving. Opened when HR records a separation or by Accounting; releasing it freezes the figures, settles the loans and pays out approved reimbursements.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `employee_id` | varchar(20) | No | FK → employees, UQ |  | Who is leaving (one case each). |
+| `last_day` | date | No |  |  | Their last day. |
+| `reason` | text | No |  |  | Why they're leaving; encrypted by the app (AES-256-GCM). |
+| `opened_by` | uuid | Yes | FK → user_accounts |  | Who opened the case. |
+| `opened_by_name` | text | No |  |  | Name of who opened it, kept if the account goes. |
+| `opened_at` | timestamptz | No |  | `now()` | When opened. |
+| `released_by` | uuid | Yes | FK → user_accounts |  | Who released it. |
+| `released_by_name` | text | Yes |  |  | Name of who released it. |
+| `released_at` | timestamptz | Yes |  |  | When released; the figures are frozen as they were then. |
+| `release_reference` | text | Yes |  |  | Check or transfer reference; encrypted by the app (AES-256-GCM). |
+| `release_items` | jsonb | Yes |  |  | The computation as released (a list of {label, detail, amount}; it names loan numbers), encrypted by the app (AES-256-GCM) and stored as one JSON string. |
+| `release_total` | numeric(12,2) | Yes |  |  | Final pay as released (negative: the employee owes the difference). |
 
 ### `reimbursement_claims`
 
@@ -659,6 +768,11 @@ Expense claims with a receipt photo. The employee's approver endorses them, then
 | `approver_decided_by_name` | text | Yes |  |  | Name of that approver, kept if the account goes. |
 | `approver_decided_at` | timestamptz | Yes |  |  | When the approver decided. |
 | `approver_note` | text | Yes |  |  | The approver's note. |
+| `paid_at` | timestamptz | Yes |  |  | When it was paid out. |
+| `paid_by` | uuid | Yes | FK → user_accounts |  | Account that recorded the payout. |
+| `paid_by_name` | text | Yes |  |  | Name of who paid it, kept if the account goes. |
+| `payout_method` | text | Yes |  |  | How it was paid: with a payroll run, by bank transfer, or in final pay. Allowed: `payroll`, `transfer`, `final pay`. |
+| `payout_reference` | text | Yes |  |  | The payroll run, the transfer reference, or Final pay; encrypted by the app (AES-256-GCM). |
 
 ## Access, workflows & audit
 
@@ -751,6 +865,30 @@ One-time backup codes for two-factor sign-in, for when the phone is lost. Only h
 | `used_at` | timestamptz | Yes |  |  | When it was used; each code works once. |
 | `created_at` | timestamptz | No |  | `now()` | When the row was created. |
 
+### `user_preferences`
+
+Each person's own settings (Settings > Account, Notifications, Appearance), kept with their account so they follow them to any computer. The theme stays on each device.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `account_id` | uuid | No | PK, FK → user_accounts |  | Whose settings. |
+| `display_name` | text | Yes |  |  | Name they'd like shown; empty = their account name. |
+| `language` | text | No |  | `'en'` | Language. Allowed: `en`. |
+| `timezone` | text | Yes |  |  | Their timezone; empty = the company default. |
+| `date_format` | text | No |  | `'MMM d, yyyy'` | How dates are shown. Allowed: `MMM d, yyyy`, `dd/MM/yyyy`, `MM/dd/yyyy`, `yyyy-MM-dd`. |
+| `week_start` | smallint | No |  | `0` | First day of the week: 0 = Sunday, 1 = Monday, 6 = Saturday. Allowed: `0`, `1`, `6`. |
+| `notifications_on` | boolean | No |  | `true` | Master switch for alerts. |
+| `notification_matrix` | jsonb | No |  | `'{}'` | Per event, in-app and email on or off, e.g. {leaveSubmitted: {inApp: true, email: false}}; events not listed use the defaults. |
+| `quiet_hours_on` | boolean | No |  | `false` | No alerts during quiet hours. |
+| `quiet_from` | time | No |  | `'20:00'` | Quiet hours start. |
+| `quiet_to` | time | No |  | `'07:00'` | Quiet hours end. |
+| `digest` | text | No |  | `'off'` | Email summary. Allowed: `off`, `daily`, `weekly`. |
+| `density` | text | No |  | `'comfortable'` | Spacing of lists and tables. Allowed: `comfortable`, `compact`. |
+| `reduce_motion` | boolean | No |  | `false` | Turn off animations. |
+| `landing_path` | text | No |  | `''` | Page opened after signing in; empty = the workspace Home. |
+| `two_step_requested` | boolean | No |  | `false` | The two-step switch in Settings > Security; stored only. Two-factor sign-in itself is user_accounts.mfa_enabled_at. |
+| `updated_at` | timestamptz | No |  | `now()` | Last change. |
+
 ### `approval_workflows`
 
 How each kind of request gets approved.
@@ -836,3 +974,55 @@ Open positions being recruited for.
 | `stage` | text | No |  | `'Sourcing'` | Stage. Allowed: `Sourcing`, `Interviewing`, `Offer extended`, `Filled`, `Cancelled`. |
 | `opened_on` | date | No |  | `current_date` | When opened. |
 | `opened_by` | uuid | Yes | FK → user_accounts |  | Who opened it. |
+
+### `company_policies`
+
+Company rules and policies HR publishes (Maintenance > Rules) for employees to read and acknowledge. Changing a published policy's title, text or document makes a new version that everyone acknowledges again.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `title` | text | No |  |  | e.g. Code of conduct. Unique among policies that aren't archived. |
+| `category` | text | No |  |  | Kind of policy. Allowed: `Employee handbook`, `Code of conduct`, `Attendance & time`, `Leave`, `Pay & benefits`, `Data privacy`, `Health & safety`, `Other`. |
+| `version` | integer | No |  | `1` | Starts at 1; goes up when a published policy's title, text or document changes. |
+| `effective_date` | date | No |  |  | When it takes effect. |
+| `summary` | text | No |  | `''` | Short summary shown in the list. |
+| `body` | text | No |  | `''` | The policy text. |
+| `file_id` | uuid | Yes | FK → files |  | Attached document (e.g. the signed PDF); the file and its name are encrypted in files. |
+| `require_ack` | boolean | No |  | `true` | Employees must confirm they've read it. |
+| `status` | text | No |  | `'draft'` | Draft (only HR sees it), published, or archived. Allowed: `draft`, `published`, `archived`. |
+| `updated_by` | uuid | Yes | FK → user_accounts |  | Who last changed it. |
+| `updated_by_name` | text | No |  |  | Name of who last changed it, kept if the account goes. |
+| `updated_at` | timestamptz | No |  | `now()` | Last change. |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
+
+### `policy_acknowledgements`
+
+Who confirmed reading which version of a company policy, and when.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `policy_id` | uuid | No | PK, FK → company_policies |  | The policy. |
+| `version` | integer | No | PK |  | The version they read. |
+| `employee_id` | varchar(20) | No | PK, FK → employees |  | Who confirmed it. |
+| `acknowledged_at` | timestamptz | No |  | `now()` | When they confirmed it. |
+
+### `outbox_messages`
+
+Email and text messages the system queues for people (Administration > Outbox), respecting their notification settings. Nothing sends them yet.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `employee_id` | varchar(20) | No | FK → employees |  | Who it goes to. |
+| `channel` | text | No |  |  | Email or text message. Allowed: `email`, `sms`. |
+| `recipient_name` | text | No |  |  | Name of who it goes to, as shown in the outbox. |
+| `address` | text | No |  |  | Email address or mobile number it goes to, encrypted by the app (AES-256-GCM). |
+| `subject` | text | No |  |  | Subject line, encrypted by the app (AES-256-GCM). |
+| `body` | text | No |  |  | Message text, encrypted by the app (AES-256-GCM). |
+| `event` | text | No |  |  | What it's about, e.g. leaveSubmitted, payslip, policy, wfh. |
+| `status` | text | No |  | `'waiting'` | Waiting to go out, sent, failed, or cleared from the outbox by an administrator. Allowed: `waiting`, `sent`, `failed`, `cancelled`. |
+| `queued_by` | uuid | Yes | FK → user_accounts |  | Account whose action queued it. |
+| `queued_by_name` | text | No |  |  | Name of who queued it, kept if the account goes. |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
+| `sent_at` | timestamptz | Yes |  |  | When it went out; empty until a sender is connected. |

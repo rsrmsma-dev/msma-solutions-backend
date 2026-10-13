@@ -3,7 +3,7 @@
 // the browser and the API server (server/src/leave.ts) apply the same rules.
 // Imports nothing that touches browser storage.
 
-import { HOLIDAYS } from "../holidays";
+import { HOLIDAYS, type Holiday } from "../holidays";
 import type { Adjustment, Balance, LeaveRequest, LeaveType } from "./types";
 
 export interface LeaveData {
@@ -16,6 +16,8 @@ export interface LeaveData {
   policy?: Partial<LeavePolicy>;
   /** Working days from Settings > Organization, 0 = Sunday … 6 = Saturday (default Monday–Friday). */
   workWeek?: number[];
+  /** Holidays to skip; the browser's calendar (HOLIDAYS) when not given. The API server passes the database's. */
+  holidays?: Holiday[];
 }
 
 export interface LeavePolicy {
@@ -66,12 +68,14 @@ export function addDays(date: string, n: number) {
 }
 
 const weekday = (date: string) => new Date(`${date}T12:00:00`).getDay();
-const isHoliday = (date: string) => HOLIDAYS.some((h) => h.date === date);
+// Leave days are counted for the whole company, so only holidays every office has are skipped.
+const isHolidayIn = (holidays: Holiday[], date: string) => holidays.some((h) => h.date === date && !h.offices?.length);
 
 /** Days a request covers: working days (the company's work week, not holidays) or every calendar day. */
-export function countDays(start: string, end: string, countBy: LeaveType["countBy"], halfDay?: "am" | "pm", workWeek: number[] = DEFAULT_WORK_WEEK) {
+export function countDays(start: string, end: string, countBy: LeaveType["countBy"], halfDay?: "am" | "pm", workWeek: number[] = DEFAULT_WORK_WEEK, holidays: Holiday[] = HOLIDAYS) {
   if (!start || !end || end < start) return 0;
   const isWorkday = (date: string) => workWeek.includes(weekday(date));
+  const isHoliday = (date: string) => isHolidayIn(holidays, date);
   if (halfDay && start === end) return countBy === "calendar" || (isWorkday(start) && !isHoliday(start)) ? 0.5 : 0;
   let n = 0;
   for (let d = start; d <= end; d = addDays(d, 1)) {
@@ -82,8 +86,9 @@ export function countDays(start: string, end: string, countBy: LeaveType["countB
 
 // ---- Balances ----
 
-/** Months credited so far this year: 1.25 days land on the 1st of each month, from the month after hire. */
+/** Months credited so far this year: 1.25 days land on the 1st of each month, from the month after hire. None before the hire date is on file. */
 function monthsEarned(hireDate: string, today: string) {
+  if (!hireDate) return 0;
   const year = Number(today.slice(0, 4));
   const thisMonth = Number(today.slice(5, 7));
   const hiredYear = Number(hireDate.slice(0, 4));
@@ -94,7 +99,8 @@ function monthsEarned(hireDate: string, today: string) {
 function eligibility(e: LeavePersonFacts | undefined, type: LeaveType): { eligible: boolean; note?: string } {
   if (!e) return { eligible: false, note: "Employee not found" };
   const sex = e.personal.sex;
-  const months = (Date.now() - new Date(`${e.job.dateHired}T00:00:00`).getTime()) / (30.44 * 86_400_000);
+  // No hire date on file yet (a record made by Add user): no service counted until it's filled in.
+  const months = e.job.dateHired ? (Date.now() - new Date(`${e.job.dateHired}T00:00:00`).getTime()) / (30.44 * 86_400_000) : 0;
   switch (type.eligibility) {
     case "female":
       return sex === "Male" ? { eligible: false, note: "For female employees" } : { eligible: true, note: sex ? undefined : "Sex not recorded in the 201 file" };
@@ -204,9 +210,9 @@ export function previewOf(data: LeaveData, person: LeavePersonFacts | undefined,
   // Half days only when Settings > Time off & leave allows them.
   const policy = policyOf(data);
   const halfDay = input.start === input.end && policy.allowHalfDays ? input.halfDay : undefined;
-  const days = countDays(input.start, input.end, type.countBy, halfDay, data.workWeek);
+  const days = countDays(input.start, input.end, type.countBy, halfDay, data.workWeek, data.holidays);
   if (days === 0) errors.push("Those dates are all weekends or holidays, so no leave is needed");
-  const holidays = HOLIDAYS.filter((h) => h.date >= input.start && h.date <= input.end);
+  const holidays = (data.holidays ?? HOLIDAYS).filter((h) => h.date >= input.start && h.date <= input.end && !h.offices?.length);
   if (holidays.length && type.countBy === "workdays") notes.push(`${holidays.map((h) => h.name).join(", ")} ${holidays.length === 1 ? "is a holiday" : "are holidays"}, not counted.`);
   if (!input.employeeId) return { days, errors, notes };
   const balance = balanceOf(data, input.employeeId, person, type);

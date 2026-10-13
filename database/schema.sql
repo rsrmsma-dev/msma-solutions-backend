@@ -35,7 +35,14 @@ CREATE TABLE company_settings (
   work_start time NOT NULL DEFAULT '08:30',
   work_end time NOT NULL DEFAULT '17:30',
   fiscal_year_start_month smallint NOT NULL DEFAULT 1,
-  retention_months smallint NOT NULL DEFAULT 0
+  retention_months smallint NOT NULL DEFAULT 0,
+  leave_half_days boolean NOT NULL DEFAULT true,
+  leave_negative_balance boolean NOT NULL DEFAULT false,
+  leave_default_carry_over smallint NOT NULL DEFAULT 0,
+  leave_accrual text NOT NULL DEFAULT 'yearly' CHECK (leave_accrual IN ('yearly', 'monthly', 'per-payroll')),
+  overtime_threshold_minutes smallint NOT NULL DEFAULT 0,
+  default_break_minutes smallint NOT NULL DEFAULT 60,
+  schedule_publish_lead_days smallint NOT NULL DEFAULT 7
 );
 
 -- The organization tree: one company, its branches, their departments and teams (clusters).
@@ -72,6 +79,42 @@ CREATE TABLE holidays (
   source text NOT NULL
 );
 
+-- Holidays HR added on the Holiday calendar, or as company holidays in Settings: proclaimed and local holidays, every year or one year only. The national holidays and the movable ones (Holy Week, National Heroes Day, Chinese New Year) are built into the app.
+CREATE TABLE holiday_rules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  holiday_type text NOT NULL CHECK (holiday_type IN ('regular', 'special')),
+  repeat_kind text NOT NULL CHECK (repeat_kind IN ('fixed', 'once')),
+  repeat_month smallint,
+  repeat_day smallint,
+  once_date date,
+  source text NOT NULL,
+  created_by uuid,
+  created_by_name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Offices a local holiday applies to. No rows means every office.
+CREATE TABLE holiday_rule_branches (
+  holiday_rule_id uuid NOT NULL,
+  branch_id uuid NOT NULL,
+  PRIMARY KEY (holiday_rule_id, branch_id)
+);
+
+-- One-year changes from a proclamation: a holiday moved to another date, or cancelled, that year.
+CREATE TABLE holiday_changes (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  builtin_rule_id text,
+  holiday_rule_id uuid,
+  year smallint NOT NULL,
+  change_kind text NOT NULL CHECK (change_kind IN ('move', 'cancel')),
+  new_date date,
+  source text NOT NULL,
+  changed_by uuid,
+  changed_by_name text NOT NULL,
+  changed_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- ======================================================================
 -- People & 201 File
 -- ======================================================================
@@ -83,12 +126,12 @@ CREATE TABLE employees (
   first_name varchar(50) NOT NULL,
   middle_name varchar(50),
   suffix varchar(10),
-  birth_date date NOT NULL,
-  sex char(1) NOT NULL CHECK (sex IN ('M', 'F')),
-  civil_status varchar(10) NOT NULL CHECK (civil_status IN ('SINGLE', 'MARRIED', 'WIDOWED', 'SEPARATED')),
-  mobile_no varchar(11) NOT NULL UNIQUE,
-  email varchar(100) NOT NULL UNIQUE,
-  date_hired date NOT NULL,
+  birth_date date,
+  sex char(1) CHECK (sex IN ('M', 'F')),
+  civil_status varchar(10) CHECK (civil_status IN ('SINGLE', 'MARRIED', 'WIDOWED', 'SEPARATED')),
+  mobile_no varchar(11) UNIQUE,
+  email varchar(100) UNIQUE,
+  date_hired date,
   employment_status varchar(12) NOT NULL DEFAULT 'PROBATIONARY' CHECK (employment_status IN ('PROBATIONARY', 'REGULAR', 'FIXED_TERM')),
   tin text,
   sss_no text,
@@ -98,7 +141,10 @@ CREATE TABLE employees (
   sss_no_hash text UNIQUE,
   philhealth_no_hash text UNIQUE,
   pagibig_no_hash text UNIQUE,
-  basic_rate numeric(12,2) NOT NULL,
+  bank_name text,
+  bank_account_name text,
+  bank_account_no text,
+  basic_rate numeric(12,2),
   nationality varchar(50) NOT NULL DEFAULT 'Filipino',
   photo_file_id uuid,
   personal_email varchar(100),
@@ -322,7 +368,8 @@ CREATE TABLE punches (
   voided_at timestamptz,
   confirmed_by uuid,
   confirmed_by_name text,
-  confirmed_at timestamptz
+  confirmed_at timestamptz,
+  location text
 );
 
 -- Overtime and undertime requests.
@@ -360,6 +407,14 @@ CREATE TABLE punch_fix_requests (
   decided_by_name text,
   decided_at timestamptz,
   decision_note text
+);
+
+-- Days an employee switched to working from home themselves (their manager is told). They clock in with a face scan.
+CREATE TABLE work_from_home_days (
+  employee_id varchar(20) NOT NULL,
+  work_date date NOT NULL,
+  declared_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (employee_id, work_date)
 );
 
 -- Work-from-home days HR declares for typhoons and emergencies.
@@ -536,7 +591,45 @@ CREATE TABLE payroll_adjustments (
   amount numeric(12,2) NOT NULL,
   is_taxable boolean NOT NULL DEFAULT false,
   reason text NOT NULL,
-  reimbursement_claim_id uuid
+  reimbursement_claim_id uuid,
+  loan_id uuid,
+  is_automatic boolean NOT NULL DEFAULT false
+);
+
+-- Loans and other recurring deductions (SSS and Pag-IBIG loans, cash advances, company loans). Each payroll run deducts the installment until the balance is zero; final pay deducts what's left.
+CREATE TABLE loans (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id varchar(20) NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('SSS salary loan', 'SSS calamity loan', 'Pag-IBIG multi-purpose loan', 'Pag-IBIG calamity loan', 'Cash advance', 'Company loan', 'Other deduction')),
+  reference text NOT NULL,
+  principal numeric(12,2) NOT NULL,
+  installment numeric(12,2) NOT NULL,
+  start_date date NOT NULL,
+  status text NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'stopped', 'settled')),
+  note text,
+  created_by uuid,
+  created_by_name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  closed_by uuid,
+  closed_by_name text,
+  closed_at timestamptz
+);
+
+-- Final pay (back pay) for someone leaving. Opened when HR records a separation or by Accounting; releasing it freezes the figures, settles the loans and pays out approved reimbursements.
+CREATE TABLE final_pay_cases (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id varchar(20) NOT NULL UNIQUE,
+  last_day date NOT NULL,
+  reason text NOT NULL,
+  opened_by uuid,
+  opened_by_name text NOT NULL,
+  opened_at timestamptz NOT NULL DEFAULT now(),
+  released_by uuid,
+  released_by_name text,
+  released_at timestamptz,
+  release_reference text,
+  release_items jsonb,
+  release_total numeric(12,2)
 );
 
 -- Expense claims with a receipt photo. The employee's approver endorses them, then Accounting gives the final approval.
@@ -559,7 +652,12 @@ CREATE TABLE reimbursement_claims (
   approver_decided_by uuid,
   approver_decided_by_name text,
   approver_decided_at timestamptz,
-  approver_note text
+  approver_note text,
+  paid_at timestamptz,
+  paid_by uuid,
+  paid_by_name text,
+  payout_method text CHECK (payout_method IN ('payroll', 'transfer', 'final pay')),
+  payout_reference text
 );
 
 -- ======================================================================
@@ -638,6 +736,27 @@ CREATE TABLE mfa_backup_codes (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+-- Each person's own settings (Settings > Account, Notifications, Appearance), kept with their account so they follow them to any computer. The theme stays on each device.
+CREATE TABLE user_preferences (
+  account_id uuid PRIMARY KEY,
+  display_name text,
+  language text NOT NULL DEFAULT 'en' CHECK (language IN ('en')),
+  timezone text,
+  date_format text NOT NULL DEFAULT 'MMM d, yyyy' CHECK (date_format IN ('MMM d, yyyy', 'dd/MM/yyyy', 'MM/dd/yyyy', 'yyyy-MM-dd')),
+  week_start smallint NOT NULL DEFAULT 0 CHECK (week_start IN (0, 1, 6)),
+  notifications_on boolean NOT NULL DEFAULT true,
+  notification_matrix jsonb NOT NULL DEFAULT '{}',
+  quiet_hours_on boolean NOT NULL DEFAULT false,
+  quiet_from time NOT NULL DEFAULT '20:00',
+  quiet_to time NOT NULL DEFAULT '07:00',
+  digest text NOT NULL DEFAULT 'off' CHECK (digest IN ('off', 'daily', 'weekly')),
+  density text NOT NULL DEFAULT 'comfortable' CHECK (density IN ('comfortable', 'compact')),
+  reduce_motion boolean NOT NULL DEFAULT false,
+  landing_path text NOT NULL DEFAULT '',
+  two_step_requested boolean NOT NULL DEFAULT false,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
 -- How each kind of request gets approved.
 CREATE TABLE approval_workflows (
   request_kind text PRIMARY KEY CHECK (request_kind IN ('leave', 'overtime', 'undertime', 'correction', 'profile')),
@@ -707,6 +826,50 @@ CREATE TABLE job_requisitions (
   opened_by uuid
 );
 
+-- Company rules and policies HR publishes (Maintenance > Rules) for employees to read and acknowledge. Changing a published policy's title, text or document makes a new version that everyone acknowledges again.
+CREATE TABLE company_policies (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  title text NOT NULL,
+  category text NOT NULL CHECK (category IN ('Employee handbook', 'Code of conduct', 'Attendance & time', 'Leave', 'Pay & benefits', 'Data privacy', 'Health & safety', 'Other')),
+  version integer NOT NULL DEFAULT 1,
+  effective_date date NOT NULL,
+  summary text NOT NULL DEFAULT '',
+  body text NOT NULL DEFAULT '',
+  file_id uuid,
+  require_ack boolean NOT NULL DEFAULT true,
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'published', 'archived')),
+  updated_by uuid,
+  updated_by_name text NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Who confirmed reading which version of a company policy, and when.
+CREATE TABLE policy_acknowledgements (
+  policy_id uuid NOT NULL,
+  version integer NOT NULL,
+  employee_id varchar(20) NOT NULL,
+  acknowledged_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (policy_id, version, employee_id)
+);
+
+-- Email and text messages the system queues for people (Administration > Outbox), respecting their notification settings. Nothing sends them yet.
+CREATE TABLE outbox_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id varchar(20) NOT NULL,
+  channel text NOT NULL CHECK (channel IN ('email', 'sms')),
+  recipient_name text NOT NULL,
+  address text NOT NULL,
+  subject text NOT NULL,
+  body text NOT NULL,
+  event text NOT NULL,
+  status text NOT NULL DEFAULT 'waiting' CHECK (status IN ('waiting', 'sent', 'failed', 'cancelled')),
+  queued_by uuid,
+  queued_by_name text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  sent_at timestamptz
+);
+
 -- What each table and column is for (shown by \dt+ and \d+ in psql)
 COMMENT ON TABLE company_settings IS 'Single row of company-wide settings: identity, sign-in security, working time and tardiness flags.';
 COMMENT ON COLUMN company_settings.id IS 'Always 1; the table holds one row.';
@@ -730,6 +893,13 @@ COMMENT ON COLUMN company_settings.work_start IS 'Usual start of the working day
 COMMENT ON COLUMN company_settings.work_end IS 'Usual end of the working day.';
 COMMENT ON COLUMN company_settings.fiscal_year_start_month IS 'Month the fiscal year starts, 1 = January.';
 COMMENT ON COLUMN company_settings.retention_months IS 'Keep records this many months after separation (0 = keep everything).';
+COMMENT ON COLUMN company_settings.leave_half_days IS 'People may file half a day of leave (Settings > Time off & leave).';
+COMMENT ON COLUMN company_settings.leave_negative_balance IS 'People may file leave beyond their remaining credits.';
+COMMENT ON COLUMN company_settings.leave_default_carry_over IS 'Carry-over limit (days) pre-filled for new leave types.';
+COMMENT ON COLUMN company_settings.leave_accrual IS 'How leave credits are granted; only yearly is calculated today.';
+COMMENT ON COLUMN company_settings.overtime_threshold_minutes IS 'Extra time after a shift shorter than this isn''t overtime (Settings > Scheduling).';
+COMMENT ON COLUMN company_settings.default_break_minutes IS 'Lunch break pre-filled for new shifts.';
+COMMENT ON COLUMN company_settings.schedule_publish_lead_days IS 'How many days ahead schedules are published; stored for when there is a publishing step.';
 COMMENT ON TABLE org_units IS 'The organization tree: one company, its branches, their departments and teams (clusters).';
 COMMENT ON COLUMN org_units.id IS 'Primary key.';
 COMMENT ON COLUMN org_units.unit_type IS 'Level in the tree.';
@@ -755,18 +925,44 @@ COMMENT ON COLUMN holidays.holiday_date IS 'The day.';
 COMMENT ON COLUMN holidays.name IS 'e.g. Araw ng Kagitingan.';
 COMMENT ON COLUMN holidays.holiday_type IS 'Regular holidays pay 200%; special days 130%.';
 COMMENT ON COLUMN holidays.source IS 'Proclamation number or reference.';
+COMMENT ON TABLE holiday_rules IS 'Holidays HR added on the Holiday calendar, or as company holidays in Settings: proclaimed and local holidays, every year or one year only. The national holidays and the movable ones (Holy Week, National Heroes Day, Chinese New Year) are built into the app.';
+COMMENT ON COLUMN holiday_rules.id IS 'Primary key.';
+COMMENT ON COLUMN holiday_rules.name IS 'e.g. Eid''l Fitr, Cebu City Charter Day.';
+COMMENT ON COLUMN holiday_rules.holiday_type IS 'Regular holidays pay 200%; special days 130%.';
+COMMENT ON COLUMN holiday_rules.repeat_kind IS 'Every year on the same date, or one year only.';
+COMMENT ON COLUMN holiday_rules.repeat_month IS 'Month (1-12), for a holiday every year.';
+COMMENT ON COLUMN holiday_rules.repeat_day IS 'Day of the month, for a holiday every year.';
+COMMENT ON COLUMN holiday_rules.once_date IS 'The date, for a one-year holiday.';
+COMMENT ON COLUMN holiday_rules.source IS 'Proclamation or ordinance; Company for company holidays added in Settings.';
+COMMENT ON COLUMN holiday_rules.created_by IS 'Who added it.';
+COMMENT ON COLUMN holiday_rules.created_by_name IS 'Name of who added it, kept if the account goes.';
+COMMENT ON COLUMN holiday_rules.created_at IS 'When the row was created.';
+COMMENT ON TABLE holiday_rule_branches IS 'Offices a local holiday applies to. No rows means every office.';
+COMMENT ON COLUMN holiday_rule_branches.holiday_rule_id IS 'The holiday.';
+COMMENT ON COLUMN holiday_rule_branches.branch_id IS 'Office it applies to.';
+COMMENT ON TABLE holiday_changes IS 'One-year changes from a proclamation: a holiday moved to another date, or cancelled, that year.';
+COMMENT ON COLUMN holiday_changes.id IS 'Primary key.';
+COMMENT ON COLUMN holiday_changes.builtin_rule_id IS 'Built-in holiday it changes (the app''s id, e.g. national-heroes-day).';
+COMMENT ON COLUMN holiday_changes.holiday_rule_id IS 'Holiday HR added that it changes.';
+COMMENT ON COLUMN holiday_changes.year IS 'The year it applies to.';
+COMMENT ON COLUMN holiday_changes.change_kind IS 'Moved or cancelled that year.';
+COMMENT ON COLUMN holiday_changes.new_date IS 'The new date, when moved.';
+COMMENT ON COLUMN holiday_changes.source IS 'Proclamation that changes it.';
+COMMENT ON COLUMN holiday_changes.changed_by IS 'Who recorded it.';
+COMMENT ON COLUMN holiday_changes.changed_by_name IS 'Name of who recorded it, kept if the account goes.';
+COMMENT ON COLUMN holiday_changes.changed_at IS 'When it was recorded.';
 COMMENT ON TABLE employees IS 'The employee master record (201 File core). Fields marked BRD follow the New Employees Template (BRD v1.1, 11.2.1). Government numbers and BASIC_RATE are HR- and Payroll-only.';
 COMMENT ON COLUMN employees.employee_id IS 'BRD. Unique employee identifier. Auto-generated if blank (MSMA-00001).';
 COMMENT ON COLUMN employees.last_name IS 'BRD. Surname. Letters only (spaces, hyphens, apostrophes, periods allowed).';
 COMMENT ON COLUMN employees.first_name IS 'BRD. Given name. Letters only.';
 COMMENT ON COLUMN employees.middle_name IS 'BRD. Middle name. Letters only.';
 COMMENT ON COLUMN employees.suffix IS 'Jr., Sr., III.';
-COMMENT ON COLUMN employees.birth_date IS 'BRD. Date of birth. Age must be 18 or older (checked by trigger).';
-COMMENT ON COLUMN employees.sex IS 'BRD. Gender. From the allowed values only.';
-COMMENT ON COLUMN employees.civil_status IS 'BRD. Marital status. From the allowed values only.';
-COMMENT ON COLUMN employees.mobile_no IS 'BRD. Mobile number, 11 digits: 09XXXXXXXXX. Unique.';
-COMMENT ON COLUMN employees.email IS 'BRD. Email address (work). Valid email format. Unique.';
-COMMENT ON COLUMN employees.date_hired IS 'BRD. First day of employment. Not more than 30 days in the future (checked by trigger).';
+COMMENT ON COLUMN employees.birth_date IS 'BRD. Date of birth. Age must be 18 or older (checked by trigger). Blank until filled in for a record made by Add user.';
+COMMENT ON COLUMN employees.sex IS 'BRD. Gender. From the allowed values only. Blank until filled in for a record made by Add user.';
+COMMENT ON COLUMN employees.civil_status IS 'BRD. Marital status. From the allowed values only. Blank until filled in for a record made by Add user.';
+COMMENT ON COLUMN employees.mobile_no IS 'BRD. Mobile number, 11 digits: 09XXXXXXXXX. Unique. Blank until filled in for a record made by Add user.';
+COMMENT ON COLUMN employees.email IS 'BRD. Email address (work). Valid email format. Unique. Blank until filled in for a record made by Add user.';
+COMMENT ON COLUMN employees.date_hired IS 'BRD. First day of employment. Not more than 30 days in the future (checked by trigger). Blank until filled in for a record made by Add user (leave earned by the month and service-based leave wait for it).';
 COMMENT ON COLUMN employees.employment_status IS 'BRD. Employment type.';
 COMMENT ON COLUMN employees.tin IS 'BRD. Tax Identification Number, encrypted by the app (AES-256-GCM). Required before first payroll.';
 COMMENT ON COLUMN employees.sss_no IS 'BRD. SSS number, encrypted by the app (AES-256-GCM). Required before first payroll.';
@@ -776,7 +972,10 @@ COMMENT ON COLUMN employees.tin_hash IS 'Fingerprint of the TIN (HMAC-SHA256), s
 COMMENT ON COLUMN employees.sss_no_hash IS 'Fingerprint of the SSS number (HMAC-SHA256), so no two employees share one.';
 COMMENT ON COLUMN employees.philhealth_no_hash IS 'Fingerprint of the PhilHealth number (HMAC-SHA256), so no two employees share one.';
 COMMENT ON COLUMN employees.pagibig_no_hash IS 'Fingerprint of the Pag-IBIG MID (HMAC-SHA256), so no two employees share one.';
-COMMENT ON COLUMN employees.basic_rate IS 'BRD. Basic monthly salary in PHP; must be > 0. Restricted to HR and Payroll.';
+COMMENT ON COLUMN employees.bank_name IS 'Bank (or e-wallet) take-home pay is sent to.';
+COMMENT ON COLUMN employees.bank_account_name IS 'Name on the account.';
+COMMENT ON COLUMN employees.bank_account_no IS 'Account number, encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN employees.basic_rate IS 'BRD. Basic monthly salary in PHP; must be > 0. Restricted to HR and Payroll. Blank until filled in for a record made by Add user; payroll runs and final pay leave the person out until then.';
 COMMENT ON COLUMN employees.nationality IS 'Nationality.';
 COMMENT ON COLUMN employees.photo_file_id IS 'ID photo.';
 COMMENT ON COLUMN employees.personal_email IS 'Personal email.';
@@ -948,6 +1147,7 @@ COMMENT ON COLUMN punches.voided_at IS 'When.';
 COMMENT ON COLUMN punches.confirmed_by IS 'HR looked at a flagged punch and kept it.';
 COMMENT ON COLUMN punches.confirmed_by_name IS 'Name of who kept it.';
 COMMENT ON COLUMN punches.confirmed_at IS 'When.';
+COMMENT ON COLUMN punches.location IS 'Where a clock-in from home was made (the phone''s GPS: latitude, longitude, accuracy in metres) or why it couldn''t be had, as JSON encrypted by the app (AES-256-GCM). Only HR, the person''s approver and the person may read it.';
 COMMENT ON TABLE time_requests IS 'Overtime and undertime requests.';
 COMMENT ON COLUMN time_requests.id IS 'Primary key.';
 COMMENT ON COLUMN time_requests.employee_id IS 'The employee this belongs to.';
@@ -979,6 +1179,10 @@ COMMENT ON COLUMN punch_fix_requests.decided_by IS 'Account that approved or dec
 COMMENT ON COLUMN punch_fix_requests.decided_by_name IS 'Name of who decided, kept if the account goes.';
 COMMENT ON COLUMN punch_fix_requests.decided_at IS 'When it was decided.';
 COMMENT ON COLUMN punch_fix_requests.decision_note IS 'Note from the approver to the employee.';
+COMMENT ON TABLE work_from_home_days IS 'Days an employee switched to working from home themselves (their manager is told). They clock in with a face scan.';
+COMMENT ON COLUMN work_from_home_days.employee_id IS 'Who works from home.';
+COMMENT ON COLUMN work_from_home_days.work_date IS 'The day.';
+COMMENT ON COLUMN work_from_home_days.declared_at IS 'When they switched.';
 COMMENT ON TABLE remote_work_days IS 'Work-from-home days HR declares for typhoons and emergencies.';
 COMMENT ON COLUMN remote_work_days.id IS 'Primary key.';
 COMMENT ON COLUMN remote_work_days.date_from IS 'First day.';
@@ -1108,6 +1312,38 @@ COMMENT ON COLUMN payroll_adjustments.amount IS 'Positive adds, negative deducts
 COMMENT ON COLUMN payroll_adjustments.is_taxable IS 'Taxable items go into gross before tax.';
 COMMENT ON COLUMN payroll_adjustments.reason IS 'Why.';
 COMMENT ON COLUMN payroll_adjustments.reimbursement_claim_id IS 'Claim being paid, if any.';
+COMMENT ON COLUMN payroll_adjustments.loan_id IS 'Loan whose installment this is, if any.';
+COMMENT ON COLUMN payroll_adjustments.is_automatic IS 'Added by payroll itself (a loan installment or an approved reimbursement), not by hand.';
+COMMENT ON TABLE loans IS 'Loans and other recurring deductions (SSS and Pag-IBIG loans, cash advances, company loans). Each payroll run deducts the installment until the balance is zero; final pay deducts what''s left.';
+COMMENT ON COLUMN loans.id IS 'Primary key.';
+COMMENT ON COLUMN loans.employee_id IS 'Who repays it.';
+COMMENT ON COLUMN loans.kind IS 'Kind of loan or deduction.';
+COMMENT ON COLUMN loans.reference IS 'The SSS/Pag-IBIG loan number, or what an Other deduction is for; encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN loans.principal IS 'The total to deduct.';
+COMMENT ON COLUMN loans.installment IS 'Taken from each cutoff''s pay until the balance is zero.';
+COMMENT ON COLUMN loans.start_date IS 'First cutoff it''s deducted from (any date inside it).';
+COMMENT ON COLUMN loans.status IS 'Running, stopped (no more deductions, e.g. paid outside payroll) or settled (closed in final pay).';
+COMMENT ON COLUMN loans.note IS 'Note, or why the deductions stopped; encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN loans.created_by IS 'Who added it.';
+COMMENT ON COLUMN loans.created_by_name IS 'Name of who added it, kept if the account goes.';
+COMMENT ON COLUMN loans.created_at IS 'When added.';
+COMMENT ON COLUMN loans.closed_by IS 'Who stopped or settled it.';
+COMMENT ON COLUMN loans.closed_by_name IS 'Name of who closed it.';
+COMMENT ON COLUMN loans.closed_at IS 'When it was stopped or settled.';
+COMMENT ON TABLE final_pay_cases IS 'Final pay (back pay) for someone leaving. Opened when HR records a separation or by Accounting; releasing it freezes the figures, settles the loans and pays out approved reimbursements.';
+COMMENT ON COLUMN final_pay_cases.id IS 'Primary key.';
+COMMENT ON COLUMN final_pay_cases.employee_id IS 'Who is leaving (one case each).';
+COMMENT ON COLUMN final_pay_cases.last_day IS 'Their last day.';
+COMMENT ON COLUMN final_pay_cases.reason IS 'Why they''re leaving; encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN final_pay_cases.opened_by IS 'Who opened the case.';
+COMMENT ON COLUMN final_pay_cases.opened_by_name IS 'Name of who opened it, kept if the account goes.';
+COMMENT ON COLUMN final_pay_cases.opened_at IS 'When opened.';
+COMMENT ON COLUMN final_pay_cases.released_by IS 'Who released it.';
+COMMENT ON COLUMN final_pay_cases.released_by_name IS 'Name of who released it.';
+COMMENT ON COLUMN final_pay_cases.released_at IS 'When released; the figures are frozen as they were then.';
+COMMENT ON COLUMN final_pay_cases.release_reference IS 'Check or transfer reference; encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN final_pay_cases.release_items IS 'The computation as released (a list of {label, detail, amount}; it names loan numbers), encrypted by the app (AES-256-GCM) and stored as one JSON string.';
+COMMENT ON COLUMN final_pay_cases.release_total IS 'Final pay as released (negative: the employee owes the difference).';
 COMMENT ON TABLE reimbursement_claims IS 'Expense claims with a receipt photo. The employee''s approver endorses them, then Accounting gives the final approval.';
 COMMENT ON COLUMN reimbursement_claims.id IS 'Primary key.';
 COMMENT ON COLUMN reimbursement_claims.employee_id IS 'The employee this belongs to.';
@@ -1128,6 +1364,11 @@ COMMENT ON COLUMN reimbursement_claims.approver_decided_by IS 'Approver (the emp
 COMMENT ON COLUMN reimbursement_claims.approver_decided_by_name IS 'Name of that approver, kept if the account goes.';
 COMMENT ON COLUMN reimbursement_claims.approver_decided_at IS 'When the approver decided.';
 COMMENT ON COLUMN reimbursement_claims.approver_note IS 'The approver''s note.';
+COMMENT ON COLUMN reimbursement_claims.paid_at IS 'When it was paid out.';
+COMMENT ON COLUMN reimbursement_claims.paid_by IS 'Account that recorded the payout.';
+COMMENT ON COLUMN reimbursement_claims.paid_by_name IS 'Name of who paid it, kept if the account goes.';
+COMMENT ON COLUMN reimbursement_claims.payout_method IS 'How it was paid: with a payroll run, by bank transfer, or in final pay.';
+COMMENT ON COLUMN reimbursement_claims.payout_reference IS 'The payroll run, the transfer reference, or Final pay; encrypted by the app (AES-256-GCM).';
 COMMENT ON TABLE subscriptions IS 'The company''s HRIS plan (SaaS): plan, seat limit and billing period. One row per period; the newest one not cancelled or expired is current.';
 COMMENT ON COLUMN subscriptions.id IS 'Primary key.';
 COMMENT ON COLUMN subscriptions.plan_name IS 'Plan the company is on, e.g. Starter, Business.';
@@ -1185,6 +1426,24 @@ COMMENT ON COLUMN mfa_backup_codes.account_id IS 'Whose code.';
 COMMENT ON COLUMN mfa_backup_codes.code_hash IS 'Argon2 hash of the code; never the code.';
 COMMENT ON COLUMN mfa_backup_codes.used_at IS 'When it was used; each code works once.';
 COMMENT ON COLUMN mfa_backup_codes.created_at IS 'When the row was created.';
+COMMENT ON TABLE user_preferences IS 'Each person''s own settings (Settings > Account, Notifications, Appearance), kept with their account so they follow them to any computer. The theme stays on each device.';
+COMMENT ON COLUMN user_preferences.account_id IS 'Whose settings.';
+COMMENT ON COLUMN user_preferences.display_name IS 'Name they''d like shown; empty = their account name.';
+COMMENT ON COLUMN user_preferences.language IS 'Language.';
+COMMENT ON COLUMN user_preferences.timezone IS 'Their timezone; empty = the company default.';
+COMMENT ON COLUMN user_preferences.date_format IS 'How dates are shown.';
+COMMENT ON COLUMN user_preferences.week_start IS 'First day of the week: 0 = Sunday, 1 = Monday, 6 = Saturday.';
+COMMENT ON COLUMN user_preferences.notifications_on IS 'Master switch for alerts.';
+COMMENT ON COLUMN user_preferences.notification_matrix IS 'Per event, in-app and email on or off, e.g. {leaveSubmitted: {inApp: true, email: false}}; events not listed use the defaults.';
+COMMENT ON COLUMN user_preferences.quiet_hours_on IS 'No alerts during quiet hours.';
+COMMENT ON COLUMN user_preferences.quiet_from IS 'Quiet hours start.';
+COMMENT ON COLUMN user_preferences.quiet_to IS 'Quiet hours end.';
+COMMENT ON COLUMN user_preferences.digest IS 'Email summary.';
+COMMENT ON COLUMN user_preferences.density IS 'Spacing of lists and tables.';
+COMMENT ON COLUMN user_preferences.reduce_motion IS 'Turn off animations.';
+COMMENT ON COLUMN user_preferences.landing_path IS 'Page opened after signing in; empty = the workspace Home.';
+COMMENT ON COLUMN user_preferences.two_step_requested IS 'The two-step switch in Settings > Security; stored only. Two-factor sign-in itself is user_accounts.mfa_enabled_at.';
+COMMENT ON COLUMN user_preferences.updated_at IS 'Last change.';
 COMMENT ON TABLE approval_workflows IS 'How each kind of request gets approved.';
 COMMENT ON COLUMN approval_workflows.request_kind IS 'Kind of request.';
 COMMENT ON COLUMN approval_workflows.remind_after_days IS 'Remind the approver after this many days (0 = never).';
@@ -1231,6 +1490,40 @@ COMMENT ON COLUMN job_requisitions.openings IS 'How many to hire.';
 COMMENT ON COLUMN job_requisitions.stage IS 'Stage.';
 COMMENT ON COLUMN job_requisitions.opened_on IS 'When opened.';
 COMMENT ON COLUMN job_requisitions.opened_by IS 'Who opened it.';
+COMMENT ON TABLE company_policies IS 'Company rules and policies HR publishes (Maintenance > Rules) for employees to read and acknowledge. Changing a published policy''s title, text or document makes a new version that everyone acknowledges again.';
+COMMENT ON COLUMN company_policies.id IS 'Primary key.';
+COMMENT ON COLUMN company_policies.title IS 'e.g. Code of conduct. Unique among policies that aren''t archived.';
+COMMENT ON COLUMN company_policies.category IS 'Kind of policy.';
+COMMENT ON COLUMN company_policies.version IS 'Starts at 1; goes up when a published policy''s title, text or document changes.';
+COMMENT ON COLUMN company_policies.effective_date IS 'When it takes effect.';
+COMMENT ON COLUMN company_policies.summary IS 'Short summary shown in the list.';
+COMMENT ON COLUMN company_policies.body IS 'The policy text.';
+COMMENT ON COLUMN company_policies.file_id IS 'Attached document (e.g. the signed PDF); the file and its name are encrypted in files.';
+COMMENT ON COLUMN company_policies.require_ack IS 'Employees must confirm they''ve read it.';
+COMMENT ON COLUMN company_policies.status IS 'Draft (only HR sees it), published, or archived.';
+COMMENT ON COLUMN company_policies.updated_by IS 'Who last changed it.';
+COMMENT ON COLUMN company_policies.updated_by_name IS 'Name of who last changed it, kept if the account goes.';
+COMMENT ON COLUMN company_policies.updated_at IS 'Last change.';
+COMMENT ON COLUMN company_policies.created_at IS 'When the row was created.';
+COMMENT ON TABLE policy_acknowledgements IS 'Who confirmed reading which version of a company policy, and when.';
+COMMENT ON COLUMN policy_acknowledgements.policy_id IS 'The policy.';
+COMMENT ON COLUMN policy_acknowledgements.version IS 'The version they read.';
+COMMENT ON COLUMN policy_acknowledgements.employee_id IS 'Who confirmed it.';
+COMMENT ON COLUMN policy_acknowledgements.acknowledged_at IS 'When they confirmed it.';
+COMMENT ON TABLE outbox_messages IS 'Email and text messages the system queues for people (Administration > Outbox), respecting their notification settings. Nothing sends them yet.';
+COMMENT ON COLUMN outbox_messages.id IS 'Primary key.';
+COMMENT ON COLUMN outbox_messages.employee_id IS 'Who it goes to.';
+COMMENT ON COLUMN outbox_messages.channel IS 'Email or text message.';
+COMMENT ON COLUMN outbox_messages.recipient_name IS 'Name of who it goes to, as shown in the outbox.';
+COMMENT ON COLUMN outbox_messages.address IS 'Email address or mobile number it goes to, encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN outbox_messages.subject IS 'Subject line, encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN outbox_messages.body IS 'Message text, encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN outbox_messages.event IS 'What it''s about, e.g. leaveSubmitted, payslip, policy, wfh.';
+COMMENT ON COLUMN outbox_messages.status IS 'Waiting to go out, sent, failed, or cleared from the outbox by an administrator.';
+COMMENT ON COLUMN outbox_messages.queued_by IS 'Account whose action queued it.';
+COMMENT ON COLUMN outbox_messages.queued_by_name IS 'Name of who queued it, kept if the account goes.';
+COMMENT ON COLUMN outbox_messages.created_at IS 'When the row was created.';
+COMMENT ON COLUMN outbox_messages.sent_at IS 'When it went out; empty until a sender is connected.';
 
 -- Extra integrity rules
 ALTER TABLE leave_requests ADD CHECK (date_to >= date_from);
@@ -1244,9 +1537,20 @@ ALTER TABLE approval_workflow_steps ADD CHECK (approver_kind <> 'role' OR role_i
 ALTER TABLE contribution_rate_versions ADD UNIQUE (agency, effective_from);
 ALTER TABLE subscriptions ADD CHECK (seat_limit IS NULL OR seat_limit > 0);
 ALTER TABLE subscriptions ADD CHECK (price_per_seat IS NULL OR price_per_seat >= 0);
+ALTER TABLE loans ADD CHECK (principal > 0 AND installment > 0 AND installment <= principal);
+ALTER TABLE final_pay_cases ADD CHECK (released_at IS NULL OR (release_items IS NOT NULL AND release_total IS NOT NULL));
+ALTER TABLE reimbursement_claims ADD CHECK ((paid_at IS NULL) = (payout_method IS NULL));
+ALTER TABLE company_settings ADD CHECK (leave_default_carry_over BETWEEN 0 AND 365 AND overtime_threshold_minutes BETWEEN 0 AND 240 AND default_break_minutes BETWEEN 0 AND 120 AND schedule_publish_lead_days BETWEEN 0 AND 60);
+ALTER TABLE holiday_rules ADD CHECK ((repeat_kind = 'fixed' AND repeat_month BETWEEN 1 AND 12 AND repeat_day BETWEEN 1 AND 31 AND once_date IS NULL) OR (repeat_kind = 'once' AND once_date IS NOT NULL AND repeat_month IS NULL AND repeat_day IS NULL));
+ALTER TABLE holiday_changes ADD CHECK ((builtin_rule_id IS NULL) <> (holiday_rule_id IS NULL));
+ALTER TABLE holiday_changes ADD CHECK ((change_kind = 'cancel' AND new_date IS NULL) OR (change_kind = 'move' AND new_date IS NOT NULL AND extract(year FROM new_date) = year));
+ALTER TABLE holiday_changes ADD UNIQUE (builtin_rule_id, year);
+ALTER TABLE holiday_changes ADD UNIQUE (holiday_rule_id, year);
+ALTER TABLE company_policies ADD CHECK (version >= 1);
+CREATE UNIQUE INDEX company_policies_title_ci ON company_policies (lower(title)) WHERE status <> 'archived';
 
 -- New Employees Template rules (BRD v1.1, 11.2.1)
-ALTER TABLE employees ADD CONSTRAINT employees_names_letters CHECK (last_name ~ $re$^[[:alpha:] .'-]+$$re$ AND first_name ~ $re$^[[:alpha:] .'-]+$$re$ AND (middle_name IS NULL OR middle_name ~ $re$^[[:alpha:] .'-]+$$re$));
+ALTER TABLE employees ADD CONSTRAINT employees_names_letters CHECK (last_name ~ $re$^[[:alpha:] .'-]*$$re$ AND first_name ~ $re$^[[:alpha:] .'-]+$$re$ AND (middle_name IS NULL OR middle_name ~ $re$^[[:alpha:] .'-]+$$re$));
 ALTER TABLE employees ADD CONSTRAINT employees_mobile_format CHECK (mobile_no ~ '^09[0-9]{9}$');
 ALTER TABLE employees ADD CONSTRAINT employees_email_format CHECK (email ~* $re$^[^@\s]+@[^@\s]+\.[^@\s]+$$re$);
 ALTER TABLE employees ADD CONSTRAINT employees_basic_rate_positive CHECK (basic_rate > 0);
@@ -1272,6 +1576,11 @@ ALTER TABLE org_units ADD CONSTRAINT org_units_parent_id_fkey FOREIGN KEY (paren
 ALTER TABLE org_units ADD CONSTRAINT org_units_head_employee_id_fkey FOREIGN KEY (head_employee_id) REFERENCES employees (employee_id) ON DELETE SET NULL ON UPDATE CASCADE;
 ALTER TABLE positions ADD CONSTRAINT positions_department_id_fkey FOREIGN KEY (department_id) REFERENCES org_units (id) ON DELETE RESTRICT;
 ALTER TABLE positions ADD CONSTRAINT positions_reports_to_position_id_fkey FOREIGN KEY (reports_to_position_id) REFERENCES positions (id) ON DELETE SET NULL;
+ALTER TABLE holiday_rules ADD CONSTRAINT holiday_rules_created_by_fkey FOREIGN KEY (created_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE holiday_rule_branches ADD CONSTRAINT holiday_rule_branches_holiday_rule_id_fkey FOREIGN KEY (holiday_rule_id) REFERENCES holiday_rules (id) ON DELETE CASCADE;
+ALTER TABLE holiday_rule_branches ADD CONSTRAINT holiday_rule_branches_branch_id_fkey FOREIGN KEY (branch_id) REFERENCES org_units (id) ON DELETE CASCADE;
+ALTER TABLE holiday_changes ADD CONSTRAINT holiday_changes_holiday_rule_id_fkey FOREIGN KEY (holiday_rule_id) REFERENCES holiday_rules (id) ON DELETE CASCADE;
+ALTER TABLE holiday_changes ADD CONSTRAINT holiday_changes_changed_by_fkey FOREIGN KEY (changed_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE employees ADD CONSTRAINT employees_photo_file_id_fkey FOREIGN KEY (photo_file_id) REFERENCES files (id) ON DELETE SET NULL;
 ALTER TABLE employees ADD CONSTRAINT employees_position_id_fkey FOREIGN KEY (position_id) REFERENCES positions (id) ON DELETE SET NULL;
 ALTER TABLE employees ADD CONSTRAINT employees_org_unit_id_fkey FOREIGN KEY (org_unit_id) REFERENCES org_units (id) ON DELETE SET NULL;
@@ -1307,6 +1616,7 @@ ALTER TABLE time_requests ADD CONSTRAINT time_requests_employee_id_fkey FOREIGN 
 ALTER TABLE time_requests ADD CONSTRAINT time_requests_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE punch_fix_requests ADD CONSTRAINT punch_fix_requests_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE punch_fix_requests ADD CONSTRAINT punch_fix_requests_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE work_from_home_days ADD CONSTRAINT work_from_home_days_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE remote_work_days ADD CONSTRAINT remote_work_days_declared_by_fkey FOREIGN KEY (declared_by) REFERENCES user_accounts (id) ON DELETE RESTRICT;
 ALTER TABLE remote_work_day_branches ADD CONSTRAINT remote_work_day_branches_remote_work_day_id_fkey FOREIGN KEY (remote_work_day_id) REFERENCES remote_work_days (id) ON DELETE CASCADE;
 ALTER TABLE remote_work_day_branches ADD CONSTRAINT remote_work_day_branches_branch_id_fkey FOREIGN KEY (branch_id) REFERENCES org_units (id) ON DELETE CASCADE;
@@ -1331,16 +1641,25 @@ ALTER TABLE payroll_run_lines ADD CONSTRAINT payroll_run_lines_employee_id_fkey 
 ALTER TABLE payroll_adjustments ADD CONSTRAINT payroll_adjustments_payroll_run_id_fkey FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs (id) ON DELETE RESTRICT;
 ALTER TABLE payroll_adjustments ADD CONSTRAINT payroll_adjustments_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE payroll_adjustments ADD CONSTRAINT payroll_adjustments_reimbursement_claim_id_fkey FOREIGN KEY (reimbursement_claim_id) REFERENCES reimbursement_claims (id) ON DELETE SET NULL;
+ALTER TABLE payroll_adjustments ADD CONSTRAINT payroll_adjustments_loan_id_fkey FOREIGN KEY (loan_id) REFERENCES loans (id) ON DELETE SET NULL;
+ALTER TABLE loans ADD CONSTRAINT loans_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE loans ADD CONSTRAINT loans_created_by_fkey FOREIGN KEY (created_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE loans ADD CONSTRAINT loans_closed_by_fkey FOREIGN KEY (closed_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE final_pay_cases ADD CONSTRAINT final_pay_cases_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE final_pay_cases ADD CONSTRAINT final_pay_cases_opened_by_fkey FOREIGN KEY (opened_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE final_pay_cases ADD CONSTRAINT final_pay_cases_released_by_fkey FOREIGN KEY (released_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_receipt_file_id_fkey FOREIGN KEY (receipt_file_id) REFERENCES files (id) ON DELETE RESTRICT;
 ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_decided_by_fkey FOREIGN KEY (decided_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_approver_decided_by_fkey FOREIGN KEY (approver_decided_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_paid_by_fkey FOREIGN KEY (paid_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_created_by_fkey FOREIGN KEY (created_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE user_accounts ADD CONSTRAINT user_accounts_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE SET NULL ON UPDATE CASCADE;
 ALTER TABLE user_accounts ADD CONSTRAINT user_accounts_role_id_fkey FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE RESTRICT;
 ALTER TABLE user_sessions ADD CONSTRAINT user_sessions_account_id_fkey FOREIGN KEY (account_id) REFERENCES user_accounts (id) ON DELETE CASCADE;
 ALTER TABLE mfa_backup_codes ADD CONSTRAINT mfa_backup_codes_account_id_fkey FOREIGN KEY (account_id) REFERENCES user_accounts (id) ON DELETE CASCADE;
+ALTER TABLE user_preferences ADD CONSTRAINT user_preferences_account_id_fkey FOREIGN KEY (account_id) REFERENCES user_accounts (id) ON DELETE CASCADE;
 ALTER TABLE approval_workflow_steps ADD CONSTRAINT approval_workflow_steps_request_kind_fkey FOREIGN KEY (request_kind) REFERENCES approval_workflows (request_kind) ON DELETE CASCADE;
 ALTER TABLE approval_workflow_steps ADD CONSTRAINT approval_workflow_steps_role_id_fkey FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE SET NULL;
 ALTER TABLE audit_log ADD CONSTRAINT audit_log_actor_account_id_fkey FOREIGN KEY (actor_account_id) REFERENCES user_accounts (id) ON DELETE SET NULL;
@@ -1350,6 +1669,12 @@ ALTER TABLE announcements ADD CONSTRAINT announcements_posted_by_fkey FOREIGN KE
 ALTER TABLE compliance_filings ADD CONSTRAINT compliance_filings_filed_by_fkey FOREIGN KEY (filed_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE job_requisitions ADD CONSTRAINT job_requisitions_position_id_fkey FOREIGN KEY (position_id) REFERENCES positions (id) ON DELETE RESTRICT;
 ALTER TABLE job_requisitions ADD CONSTRAINT job_requisitions_opened_by_fkey FOREIGN KEY (opened_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE company_policies ADD CONSTRAINT company_policies_file_id_fkey FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE SET NULL;
+ALTER TABLE company_policies ADD CONSTRAINT company_policies_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE policy_acknowledgements ADD CONSTRAINT policy_acknowledgements_policy_id_fkey FOREIGN KEY (policy_id) REFERENCES company_policies (id) ON DELETE RESTRICT;
+ALTER TABLE policy_acknowledgements ADD CONSTRAINT policy_acknowledgements_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE outbox_messages ADD CONSTRAINT outbox_messages_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE outbox_messages ADD CONSTRAINT outbox_messages_queued_by_fkey FOREIGN KEY (queued_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 
 -- Indexes on foreign keys and common lookups
 CREATE INDEX ON announcements (branch_id);
@@ -1362,6 +1687,8 @@ CREATE INDEX ON audit_log (actor_account_id);
 CREATE INDEX ON audit_log (employee_id);
 CREATE INDEX ON certificate_requests (employee_id);
 CREATE INDEX ON company_assets (assigned_employee_id);
+CREATE INDEX ON company_policies (file_id);
+CREATE INDEX ON company_policies (updated_by);
 CREATE INDEX ON company_settings (logo_file_id);
 CREATE INDEX ON company_settings (updated_by);
 CREATE INDEX ON compliance_filings (filed_by);
@@ -1379,6 +1706,13 @@ CREATE INDEX ON employees (photo_file_id);
 CREATE INDEX ON employees (position_id);
 CREATE INDEX ON employees (supervisor_id);
 CREATE INDEX ON files (uploaded_by);
+CREATE INDEX ON final_pay_cases (employee_id);
+CREATE INDEX ON final_pay_cases (opened_by);
+CREATE INDEX ON final_pay_cases (released_by);
+CREATE INDEX ON holiday_changes (changed_by);
+CREATE INDEX ON holiday_changes (holiday_rule_id);
+CREATE INDEX ON holiday_rule_branches (branch_id);
+CREATE INDEX ON holiday_rules (created_by);
 CREATE INDEX ON job_events (employee_id);
 CREATE INDEX ON job_events (recorded_by);
 CREATE INDEX ON job_requisitions (opened_by);
@@ -1392,11 +1726,17 @@ CREATE INDEX ON leave_requests (decided_by);
 CREATE INDEX ON leave_requests (employee_id);
 CREATE INDEX ON leave_requests (filed_by);
 CREATE INDEX ON leave_requests (leave_type_id);
+CREATE INDEX ON loans (closed_by);
+CREATE INDEX ON loans (created_by);
+CREATE INDEX ON loans (employee_id);
 CREATE INDEX ON mfa_backup_codes (account_id);
 CREATE INDEX ON offboarding_cases (employee_id);
 CREATE INDEX ON org_units (head_employee_id);
 CREATE INDEX ON org_units (parent_id);
+CREATE INDEX ON outbox_messages (employee_id);
+CREATE INDEX ON outbox_messages (queued_by);
 CREATE INDEX ON payroll_adjustments (employee_id);
+CREATE INDEX ON payroll_adjustments (loan_id);
 CREATE INDEX ON payroll_adjustments (payroll_run_id);
 CREATE INDEX ON payroll_adjustments (reimbursement_claim_id);
 CREATE INDEX ON payroll_run_lines (employee_id);
@@ -1405,6 +1745,7 @@ CREATE INDEX ON payroll_runs (branch_id);
 CREATE INDEX ON payroll_runs (created_by);
 CREATE INDEX ON performance_reviews (employee_id);
 CREATE INDEX ON performance_reviews (reviewer_id);
+CREATE INDEX ON policy_acknowledgements (employee_id);
 CREATE INDEX ON positions (department_id);
 CREATE INDEX ON positions (reports_to_position_id);
 CREATE INDEX ON professional_licenses (employee_id);
@@ -1418,6 +1759,7 @@ CREATE INDEX ON punches (voided_by);
 CREATE INDEX ON reimbursement_claims (approver_decided_by);
 CREATE INDEX ON reimbursement_claims (decided_by);
 CREATE INDEX ON reimbursement_claims (employee_id);
+CREATE INDEX ON reimbursement_claims (paid_by);
 CREATE INDEX ON reimbursement_claims (receipt_file_id);
 CREATE INDEX ON remote_work_day_branches (branch_id);
 CREATE INDEX ON remote_work_days (declared_by);
@@ -1436,5 +1778,5 @@ CREATE INDEX ON leave_requests (employee_id, date_from, date_to);
 CREATE INDEX ON audit_log (employee_id, occurred_at DESC);
 CREATE INDEX ON employee_documents (expires_on) WHERE expires_on IS NOT NULL;
 
-INSERT INTO schema_migrations (version) VALUES ('001_leave'), ('002_timekeeping'), ('003_payroll'), ('004_files'), ('005_comments'), ('006_roles_settings'), ('007_subscriptions'), ('008_audit_append_only'), ('009_encrypt_government_numbers'), ('010_encrypt_document_numbers'), ('011_encrypt_files_and_reasons'), ('012_encrypt_file_names'), ('013_mfa'), ('014_registration_requests'), ('015_admin_role'), ('016_registration_creates_sign_in');
+INSERT INTO schema_migrations (version) VALUES ('001_leave'), ('002_timekeeping'), ('003_payroll'), ('004_files'), ('005_comments'), ('006_roles_settings'), ('007_subscriptions'), ('008_audit_append_only'), ('009_encrypt_government_numbers'), ('010_encrypt_document_numbers'), ('011_encrypt_files_and_reasons'), ('012_encrypt_file_names'), ('013_mfa'), ('014_registration_requests'), ('015_admin_role'), ('016_registration_creates_sign_in'), ('017_bank_and_wfh'), ('018_final_pay_loans_payouts'), ('019_holidays_org_settings'), ('020_policies_outbox_wfh_location'), ('021_employee_details_later'), ('022_last_name_later');
 COMMIT;

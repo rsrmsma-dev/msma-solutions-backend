@@ -10,8 +10,10 @@
 import type pg from "pg";
 import { DEFAULT_SHIFTS, shiftProblem, tardinessRuleProblem } from "../../src/lib/timekeeping/rules";
 import type { ShiftTemplate } from "../../src/lib/timekeeping/types";
-import { demand, seenIds, type Session } from "./auth";
-import { clean, pool, tx, UserError, type Db } from "./db";
+import { can, demand, seenIds, type Session } from "./auth";
+import { open, seal } from "./crypto";
+import { clean, pool, schema020, tx, UserError, type Db } from "./db";
+import { schedulingRules } from "./settings";
 
 const TZ = process.env.APP_TIME_ZONE ?? "Asia/Manila";
 const HHMM = /^\d{2}:\d{2}$/;
@@ -62,11 +64,33 @@ async function branchOf(db: Db, employeeId: string): Promise<{ id: string; name:
 
 const PUNCH_SELECT = `select *, to_char(punched_at at time zone $1, 'YYYY-MM-DD"T"HH24:MI') as at_local from punches`;
 
-function punchJson(p: any) {
+/**
+ * Where a clock-in from home was made, for HR, the person's approver and the person only (Accounting
+ * sees attendance for payroll, but not where people were).
+ */
+function locationOf(s: Session | undefined, p: any) {
+  if (!s || !p.location || !can(s, "view", "people", p.employee_id)) return undefined;
+  try {
+    return JSON.parse(open(p.location));
+  } catch {
+    return undefined;
+  }
+}
+
+/** The phone's location sent with a clock-in from home: {lat, lng, accuracy}, or why it's missing. */
+function parseLocation(v: any): string | null {
+  if (!v || typeof v !== "object") return null;
+  if (typeof v.unavailable === "string") return JSON.stringify({ unavailable: v.unavailable.trim().slice(0, 120) || "Location couldn't be found" });
+  const lat = Number(v.lat), lng = Number(v.lng), accuracy = Number(v.accuracy);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90 || Math.abs(lng) > 180 || !Number.isFinite(accuracy) || accuracy < 0) return null;
+  return JSON.stringify({ lat: Math.round(lat * 1e5) / 1e5, lng: Math.round(lng * 1e5) / 1e5, accuracy: Math.round(Math.min(accuracy, 1e6)) });
+}
+
+function punchJson(p: any, s?: Session) {
   return clean({
     id: p.id, employeeId: p.employee_id, workDate: p.work_date, at: p.at_local, kind: p.direction,
     source: p.source === "remote" ? "face" : p.source, device: p.device_label ?? "", deviceBranch: p.device_branch, deviceRegistered: true,
-    match: p.face_match, reason: p.reason, recordedBy: p.recorded_by_name,
+    match: p.face_match, location: locationOf(s, p), reason: p.reason, recordedBy: p.recorded_by_name,
   });
 }
 
@@ -102,7 +126,7 @@ export async function loadState(s: Session) {
   // Person-specific rows are limited to those people (as a query parameter).
   const own = (base: string, order = "") =>
     all ? pool.query(`${base} ${order}`) : pool.query(`${base} ${base.includes(" where ") ? "and" : "where"} employee_id = any($1) ${order}`, [ids]);
-  const [shifts, usual, overrides, punches, requests, fixes, auditRows, settings, notices, remote] = await Promise.all([
+  const [shifts, usual, overrides, punches, requests, fixes, auditRows, settings, notices, remote, wfh] = await Promise.all([
     pool.query(`select * from shift_templates order by name`),
     own(`select employee_id, default_shift_id from employees where default_shift_id is not null`),
     own(`select * from schedule_overrides`),
@@ -119,15 +143,17 @@ export async function loadState(s: Session) {
     pool.query(`select d.*, coalesce(array_agg(u.name order by u.name) filter (where u.name is not null), '{}') as offices
                   from remote_work_days d left join remote_work_day_branches b on b.remote_work_day_id = d.id left join org_units u on u.id = b.branch_id
                  group by d.id order by d.date_from desc`),
+    own(`select employee_id, work_date, declared_at from work_from_home_days`, `order by work_date desc`),
   ]);
   const ps = punches.rows;
   const st = settings.rows[0];
+  const rules = await schedulingRules();
   return {
     shifts: shifts.rows.map(shiftJson),
     usualShift: Object.fromEntries(usual.rows.map((r) => [r.employee_id, r.default_shift_id])),
     overrides: Object.fromEntries(overrides.rows.map((o) => [`${o.employee_id}|${o.work_date}`, o.shift_id ?? "rest"])),
-    corrections: ps.filter((p) => p.source === "manual").map(punchJson),
-    remotePunches: ps.filter((p) => p.source === "remote").map(punchJson),
+    corrections: ps.filter((p) => p.source === "manual").map((p) => punchJson(p)),
+    remotePunches: ps.filter((p) => p.source === "remote").map((p) => punchJson(p, s)),
     voided: Object.fromEntries(ps.filter((p) => p.voided_at).map((p) => [p.id, { reason: p.voided_reason, by: p.voided_by_name ?? "", at: iso(p.voided_at) }])),
     confirmed: Object.fromEntries(ps.filter((p) => p.confirmed_at).map((p) => [p.id, { by: p.confirmed_by_name ?? "", at: iso(p.confirmed_at) }])),
     requests: requests.rows.map(requestJson),
@@ -136,8 +162,11 @@ export async function loadState(s: Session) {
     tardinessRule: st ? { consecutive: st.tardy_consecutive_days, perMonth: st.tardy_per_month } : undefined,
     notices: notices.rows.map(noticeJson),
     remoteDays: remote.rows.map((d) => ({ id: d.id, from: d.date_from, to: d.date_to, offices: d.offices, reason: d.reason, declaredBy: d.declared_by_name, declaredAt: iso(d.declared_at) })),
+    wfh: wfh.rows.map((w) => ({ id: `wfh-${w.employee_id}-${w.work_date}`, employeeId: w.employee_id, date: w.work_date, declaredAt: iso(w.declared_at)! })),
     seededRequests: true,
     seasonShifts: true,
+    // Settings > Scheduling: the overtime threshold the browser applies when it works out each day.
+    rules,
   };
 }
 
@@ -393,15 +422,17 @@ export async function cancelRemoteDay(s: Session, id: string) {
 }
 
 /** Time-in or time-out from home after a face scan; only on a remote work day, only for yourself. */
-export async function clockRemote(s: Session, kind: string, match: unknown) {
+export async function clockRemote(s: Session, kind: string, match: unknown, location?: unknown) {
   if (!s.employeeNo) throw new UserError("Your sign-in isn't linked to an employee record. Ask HR to link it.");
   if (kind !== "in" && kind !== "out") throw new UserError("Choose time-in or time-out");
   const employeeId = s.employeeNo;
   return tx(async (c) => {
     await c.query(`select pg_advisory_xact_lock(hashtext('clock:' || $1))`, [employeeId]);
     const date = await today(c);
-    const day = await remoteDayFor(c, employeeId, date);
-    if (!day) throw new UserError("Remote clock-in is only open on remote work days that HR declares");
+    const declared = await remoteDayFor(c, employeeId, date);
+    const ownWfh = !declared && (await c.query(`select 1 from work_from_home_days where employee_id = $1 and work_date = $2`, [employeeId, date])).rowCount;
+    if (!declared && !ownWfh) throw new UserError("Remote clock-in is only open on remote work days that HR declares, or on a day you switched to work from home");
+    const day = declared ?? { reason: "Work from home" };
     const mine = (await c.query(`select direction from punches where employee_id = $1 and work_date = $2 and source = 'remote' and voided_at is null`, [employeeId, date])).rows;
     if (kind === "in" && mine.some((p) => p.direction === "in")) throw new UserError("You already clocked in today");
     if (kind === "out" && !mine.some((p) => p.direction === "in")) throw new UserError("Clock in first");
@@ -411,7 +442,36 @@ export async function clockRemote(s: Session, kind: string, match: unknown) {
        values ($1, $2, date_trunc('minute', now()), $3, 'remote', 'Remote · face scan', $4, $5, $6, $7) returning id`,
       [employeeId, date, kind, m, day.reason, s.accountId, s.name],
     );
-    return punchJson((await c.query(`${PUNCH_SELECT} where id = $2`, [TZ, p.id])).rows[0]);
+    // The location is saved (encrypted) once migration 020 is applied; clocking in never waits on it.
+    const where = parseLocation(location);
+    if (where && (await schema020(c))) await c.query(`update punches set location = $2 where id = $1`, [p.id, seal(where)]);
+    return punchJson((await c.query(`${PUNCH_SELECT} where id = $2`, [TZ, p.id])).rows[0], s);
+  });
+}
+
+// ---- Work from home (the employee's own choice, for today) ----
+
+/**
+ * Switches today to working from home, or back to an office day. Only for yourself, and not on a
+ * day HR already declared remote for your office. Switching back sets aside today's clock-ins from home.
+ */
+export async function setWorkFromHome(s: Session, on: boolean) {
+  if (!s.employeeNo) throw new UserError("Your sign-in isn't linked to an employee record. Ask HR to link it.");
+  const employeeId = s.employeeNo;
+  return tx(async (c) => {
+    await c.query(`select pg_advisory_xact_lock(hashtext('clock:' || $1))`, [employeeId]);
+    const date = await today(c);
+    if (await remoteDayFor(c, employeeId, date)) throw new UserError("Today is already a remote work day for your office");
+    if (on) {
+      await c.query(`insert into work_from_home_days (employee_id, work_date) values ($1, $2) on conflict do nothing`, [employeeId, date]);
+      await log(c, s, employeeId, date, "Switched to work from home", "Clocks in with a face scan");
+    } else {
+      const { rowCount } = await c.query(`delete from work_from_home_days where employee_id = $1 and work_date = $2`, [employeeId, date]);
+      if (!rowCount) return;
+      const mine = (await c.query(`${PUNCH_SELECT} where employee_id = $2 and work_date = $3 and source = 'remote' and voided_at is null`, [TZ, employeeId, date])).rows;
+      for (const p of mine) await setAside(c, s, p, "Switched back to an office day");
+      await log(c, s, employeeId, date, "Switched back to an office day", "");
+    }
   });
 }
 

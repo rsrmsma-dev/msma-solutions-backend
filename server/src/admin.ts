@@ -48,11 +48,10 @@ export async function listRoles(withCounts: boolean, db: Db = pool, s?: Session)
             (select count(*)::int from user_accounts a where a.role_id = r.id) as users
        from roles r order by array_position(array['system_admin','admin','super_admin','hr','approver','accounting','employee'], r.role_key)`,
   );
-  // Our own roles stay out of the client's lists. The website knows six roles, so Admin is sent
-  // as a Super Admin (same access); the server still tells them apart.
+  // Our own roles stay out of the client's lists.
   const ours = !!s?.accountRole && OUR_ROLES.includes(s.accountRole);
-  return rows.filter((r) => ours || !OUR_ROLES.includes(r.key) || r.key === s?.accountRole).map((r) => {
-    if (r.key === "admin") r.key = "super_admin";
+  // The old "admin" role is retired (no accounts use it); its row stays in the database but is never listed.
+  return rows.filter((r) => r.key !== "admin" && (ours || !OUR_ROLES.includes(r.key) || r.key === s?.accountRole)).map((r) => {
     const out = { ...r, access: none, ...(r.superAdmin ? {} : { superAdmin: undefined }) };
     if (!withCounts) delete out.users;
     return clean(out);

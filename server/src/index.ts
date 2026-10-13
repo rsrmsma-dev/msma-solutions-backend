@@ -10,8 +10,15 @@ import * as corehr from "./corehr.js";
 import * as leave from "./leave.js";
 import * as tk from "./timekeeping.js";
 import * as payroll from "./payroll.js";
+import * as loans from "./loans.js";
+import * as finalpay from "./finalpay.js";
 import * as reimb from "./reimbursements.js";
 import * as records from "./records.js";
+import * as holidays from "./holidays.js";
+import * as orgunits from "./orgunits.js";
+import * as settings from "./settings.js";
+import * as policies from "./policies.js";
+import * as outbox from "./outbox.js";
 import { pool, UserError } from "./db.js";
 
 // Behind a reverse proxy (nginx, a load balancer), set TRUST_PROXY=1 so each visitor's own address is
@@ -73,6 +80,7 @@ const CONSTRAINT_MESSAGES: Record<string, string> = {
   employees_names_letters: "Names can only have letters",
   employees_basic_rate_positive: "Enter the monthly salary",
   payroll_adjustments_payroll_run_id_employee_id_fkey: "That employee isn't in this run",
+  company_policies_title_ci: "There's already a policy with that title",
 };
 
 app.setErrorHandler((err, req, reply) => {
@@ -94,6 +102,12 @@ const cookieOptions = { path: "/", httpOnly: true, sameSite: "lax" as const, sec
 
 app.post<{ Body: { username?: string; password?: string } }>("/api/auth/login", async (req, reply) => {
   if (recentFails(req.ip).length >= LOGIN_TRIES) return reply.code(429).send({ error: "Too many sign-in attempts from this network. Wait 15 minutes and try again." });
+  // Someone whose last day has passed can't sign in any more. A failure here never blocks signing in.
+  try {
+    await corehr.separationsDue(pool);
+  } catch (e) {
+    req.log.error(e, "Couldn't apply separations that are due");
+  }
   let result;
   try {
     result = await signIn(String(req.body?.username ?? ""), String(req.body?.password ?? ""), req.headers["user-agent"]);
@@ -165,7 +179,59 @@ app.register(async (r) => {
   r.post<{ Params: { id: string } }>("/api/corehr/employees/:id/reveal-government", async (req) => (await corehr.logGovernmentReveal(req.session!, req.params.id), { ok: true }));
   r.put<{ Params: { id: string }; Body: { supervisorId: string | null } }>("/api/corehr/employees/:id/supervisor", async (req) => (await corehr.setReportsTo(req.session!, req.params.id, req.body?.supervisorId ?? null), { ok: true }));
   r.put<{ Body: { employeeId: string } }>("/api/corehr/company-head", async (req) => (await corehr.setCompanyHead(req.session!, String(req.body?.employeeId ?? "")), { ok: true }));
+  r.post<{ Params: { id: string }; Body: any }>("/api/corehr/employees/:id/separation", (req) => corehr.recordSeparation(req.session!, req.params.id, req.body));
+  r.delete<{ Params: { id: string } }>("/api/corehr/employees/:id/separation", (req) => corehr.cancelSeparation(req.session!, req.params.id));
   r.patch<{ Params: { id: string }; Body: unknown }>("/api/corehr/documents/:id", async (req) => (await corehr.updateDocument(req.session!, req.params.id, req.body), { ok: true }));
+
+  // Maintenance > Locations and Departments.
+  r.post<{ Body: any }>("/api/corehr/locations", (req) => orgunits.saveLocation(req.session!, undefined, req.body));
+  r.put<{ Params: { id: string }; Body: any }>("/api/corehr/locations/:id", (req) => orgunits.saveLocation(req.session!, req.params.id, req.body));
+  r.put<{ Params: { id: string }; Body: { active?: unknown } }>("/api/corehr/locations/:id/active", async (req) => (await orgunits.setLocationActive(req.session!, req.params.id, req.body?.active), { ok: true }));
+  r.post<{ Body: any }>("/api/corehr/departments", (req) => orgunits.saveDepartment(req.session!, undefined, req.body));
+  r.put<{ Params: { id: string }; Body: any }>("/api/corehr/departments/:id", (req) => orgunits.saveDepartment(req.session!, req.params.id, req.body));
+  r.put<{ Params: { id: string }; Body: { active?: unknown } }>("/api/corehr/departments/:id/active", async (req) => (await orgunits.setDepartmentActive(req.session!, req.params.id, req.body?.active), { ok: true }));
+});
+
+// ---- Holiday calendar ----
+
+app.register(async (r) => {
+  r.addHook("preHandler", requireSession);
+  const ok = { ok: true };
+  r.get("/api/holidays", () => holidays.listHolidays());
+  r.post<{ Body: any }>("/api/holidays", (req) => holidays.addHoliday(req.session!, req.body));
+  r.put<{ Body: any }>("/api/holidays/changes", (req) => holidays.changeForYear(req.session!, req.body));
+  r.delete<{ Params: { ruleId: string; year: string } }>("/api/holidays/changes/:ruleId/:year", async (req) => (await holidays.undoChange(req.session!, req.params.ruleId, Number(req.params.year)), ok));
+  r.delete<{ Params: { id: string } }>("/api/holidays/:id", async (req) => (await holidays.removeHoliday(req.session!, req.params.id), ok));
+});
+
+// ---- Settings: leave policy, scheduling rules and personal settings ----
+
+app.register(async (r) => {
+  r.addHook("preHandler", requireSession);
+  r.put<{ Body: any }>("/api/settings/leave-policy", (req) => settings.saveLeavePolicy(req.session!, req.body));
+  r.put<{ Body: any }>("/api/settings/scheduling", (req) => settings.saveSchedulingRules(req.session!, req.body));
+  r.get("/api/me/preferences", (req) => settings.myPreferences(req.session!));
+  r.put<{ Params: { section: string }; Body: any }>("/api/me/preferences/:section", (req) => settings.saveMyPreferences(req.session!, req.params.section, req.body));
+});
+
+// ---- Company policies and the email / text outbox ----
+
+app.register(async (r) => {
+  r.addHook("preHandler", requireSession);
+  const ok = { ok: true };
+  r.get("/api/policies", (req) => policies.listPolicies(req.session!));
+  r.get("/api/policies/mine", (req) => policies.myPolicies(req.session!));
+  r.post<{ Body: any }>("/api/policies", (req) => policies.savePolicy(req.session!, undefined, req.body));
+  r.put<{ Params: { id: string }; Body: any }>("/api/policies/:id", (req) => policies.savePolicy(req.session!, req.params.id, req.body));
+  r.put<{ Params: { id: string }; Body: { status?: unknown } }>("/api/policies/:id/status", async (req) => (await policies.setPolicyStatus(req.session!, req.params.id, req.body?.status), ok));
+  r.delete<{ Params: { id: string } }>("/api/policies/:id", async (req) => (await policies.deletePolicy(req.session!, req.params.id), ok));
+  r.get<{ Params: { id: string } }>("/api/policies/:id/acknowledgements", (req) => policies.acknowledgementsFor(req.session!, req.params.id));
+  r.post<{ Params: { id: string } }>("/api/policies/:id/acknowledge", async (req) => (await policies.acknowledgePolicy(req.session!, req.params.id), ok));
+  // A policy's document comes in as a data URL before the policy is saved; it's read back through /api/files/:id.
+  r.post<{ Body: any }>("/api/policies/files", { bodyLimit: 15 * 1024 * 1024 }, (req) => policies.uploadFile(req.session!, req.body));
+  r.get("/api/outbox", (req) => outbox.listOutbox(req.session!));
+  r.post<{ Body: any }>("/api/outbox", (req) => outbox.queueFromBrowser(req.session!, req.body));
+  r.delete("/api/outbox", async (req) => (await outbox.clearOutbox(req.session!), ok));
 });
 
 // ---- Leave ----
@@ -202,7 +268,8 @@ app.register(async (r) => {
   r.put<{ Body: any }>("/api/timekeeping/tardiness-rule", (req) => tk.saveTardinessRule(req.session!, req.body));
   r.post<{ Body: any }>("/api/timekeeping/remote-days", (req) => tk.declareRemoteDay(req.session!, req.body));
   r.delete<{ Params: { id: string } }>("/api/timekeeping/remote-days/:id", async (req) => (await tk.cancelRemoteDay(req.session!, req.params.id), ok));
-  r.post<{ Body: { kind?: string; match?: unknown } }>("/api/timekeeping/clock", (req) => tk.clockRemote(req.session!, String(req.body?.kind ?? ""), req.body?.match));
+  r.post<{ Body: { on?: boolean } }>("/api/timekeeping/wfh", async (req) => (await tk.setWorkFromHome(req.session!, req.body?.on === true), ok));
+  r.post<{ Body: { kind?: string; match?: unknown; location?: unknown } }>("/api/timekeeping/clock", (req) => tk.clockRemote(req.session!, String(req.body?.kind ?? ""), req.body?.match, req.body?.location));
   r.post<{ Body: any }>("/api/timekeeping/notices", (req) => tk.sendNotice(req.session!, req.body));
   r.post<{ Params: { id: string } }>("/api/timekeeping/notices/:id/acknowledge", async (req) => (await tk.acknowledgeNotice(req.session!, req.params.id), ok));
   r.post<{ Body: any }>("/api/timekeeping/fixes", (req) => tk.fileFix(req.session!, req.body));
@@ -227,6 +294,15 @@ app.register(async (r) => {
   r.post<{ Params: { id: string }; Body: any }>("/api/payroll/runs/:id/approve", (req) => payroll.approveRun(req.session!, req.params.id, req.body));
   r.delete<{ Params: { id: string } }>("/api/payroll/runs/:id", async (req) => (await payroll.deleteRun(req.session!, req.params.id), ok));
   r.get("/api/payroll/my-payslips", (req) => payroll.myPayslips(req.session!));
+  // Loans & deductions, and final pay.
+  r.get("/api/payroll/loans", (req) => loans.listLoans(req.session!));
+  r.post<{ Body: any }>("/api/payroll/loans", (req) => loans.saveLoan(req.session!, undefined, req.body));
+  r.put<{ Params: { id: string }; Body: any }>("/api/payroll/loans/:id", (req) => loans.saveLoan(req.session!, req.params.id, req.body));
+  r.post<{ Params: { id: string }; Body: { reason?: string } }>("/api/payroll/loans/:id/stop", async (req) => (await loans.stopLoan(req.session!, req.params.id, String(req.body?.reason ?? "")), ok));
+  r.get("/api/payroll/final-pay", (req) => finalpay.listCases(req.session!));
+  r.post<{ Body: any }>("/api/payroll/final-pay", (req) => finalpay.openCase(req.session!, req.body));
+  r.post<{ Body: any }>("/api/payroll/final-pay/release", (req) => finalpay.releaseCase(req.session!, req.body));
+  r.delete<{ Params: { id: string } }>("/api/payroll/final-pay/:id", async (req) => (await finalpay.removeCase(req.session!, req.params.id), ok));
 });
 
 // ---- Reimbursements and stored files ----
@@ -238,6 +314,7 @@ app.register(async (r) => {
   r.post<{ Body: any }>("/api/reimbursements/claims", { bodyLimit: 8 * 1024 * 1024 }, (req) => reimb.fileClaim(req.session!, req.body));
   r.post<{ Params: { id: string }; Body: { approve?: boolean; note?: string } }>("/api/reimbursements/claims/:id/decision", (req) =>
     reimb.decideClaim(req.session!, req.params.id, !!req.body?.approve, String(req.body?.note ?? "")));
+  r.post<{ Body: any }>("/api/reimbursements/claims/pay", (req) => reimb.payClaimsByTransfer(req.session!, req.body));
   r.get<{ Params: { id: string } }>("/api/files/:id", async (req, reply) => {
     const f = await reimb.readFile(req.session!, req.params.id);
     return sendFile(reply, f, 3600);

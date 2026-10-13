@@ -50,6 +50,9 @@ export interface Position {
 export const EMPLOYMENT_STATUSES = ["Active", "On leave", "Suspended", "Separated"] as const;
 export type EmploymentStatus = (typeof EMPLOYMENT_STATUSES)[number];
 
+/** Why someone is leaving (Core HR › Separation). Here so the API server checks the same list. */
+export const SEPARATION_REASONS = ["Resigned", "End of contract", "Retired", "Terminated", "Redundancy", "Death", "Other"] as const;
+
 export const CIVIL_STATUSES = ["Single", "Married", "Widowed", "Separated"] as const;
 export type CivilStatus = (typeof CIVIL_STATUSES)[number];
 
@@ -83,6 +86,13 @@ export interface GovernmentNumbers {
   tin: string;
 }
 
+/** Where take-home pay is sent. Optional: older records and new hires may not have it yet. */
+export interface BankDetails {
+  bank: string;
+  accountName: string;
+  accountNumber: string;
+}
+
 export interface JobInfo {
   positionId: string;
   /** A team, or the department itself when they aren't in a team. */
@@ -102,6 +112,7 @@ export interface CoreEmployee {
   personal: PersonalInfo;
   contact: ContactInfo;
   government: GovernmentNumbers;
+  bank?: BankDetails;
   job: JobInfo;
   createdAt: string;
   /** Face template enrolled, so they can clock in from home with a face scan. */
@@ -167,7 +178,7 @@ export interface AuditEntry {
   id: string;
   employeeId: string;
   actor: string;
-  action: "Created" | "Edited" | "Viewed" | "Uploaded" | "Verified" | "Recorded";
+  action: "Created" | "Edited" | "Viewed" | "Uploaded" | "Verified" | "Recorded" | "Deleted";
   section: string;
   summary: string;
   at: string;

@@ -6,11 +6,14 @@
 // codes (Male <-> M, Regular <-> REGULAR, ...).
 
 import type pg from "pg";
+import { z } from "zod";
 import { contactSchema, governmentSchema, newEmployeeSchema, personalSchema } from "../../src/lib/corehr/schemas.js";
+import { SEPARATION_REASONS } from "../../src/lib/corehr/types.js";
 import { audit, can, demand, scopeOf, seen, seenIds, type Session } from "./auth.js";
 import { createHash } from "node:crypto";
 import { fingerprint, open, seal, sealBytes } from "./crypto.js";
 import { clean, pool, tx, UserError, type Db } from "./db.js";
+import { dropCase, ensureCase } from "./finalpay.js";
 
 const DOCUMENT_TYPES = [
   "Application Form / Resume",
@@ -63,9 +66,10 @@ function employeeJson(r: any) {
       emergencyName: r.emergency_name ?? "", emergencyRelationship: r.emergency_relationship ?? "", emergencyPhone: r.emergency_phone ?? "",
     },
     government: { sss: open(r.sss_no), philhealth: open(r.philhealth_no), pagibig: open(r.pagibig_no), tin: open(r.tin) },
+    bank: r.bank_name ? { bank: r.bank_name, accountName: r.bank_account_name ?? "", accountNumber: open(r.bank_account_no) } : undefined,
     job: {
       positionId: r.position_id ?? "", unitId: r.org_unit_id ?? "", supervisorId: r.supervisor_id, employmentType: FROM.employment[r.employment_status], status: FROM.record[r.record_status],
-      dateHired: r.date_hired, regularizationDate: r.regularization_date, separationDate: r.separation_date, monthlySalary: r.basic_rate, workSchedule: r.work_schedule ?? "",
+      dateHired: r.date_hired ?? "", regularizationDate: r.regularization_date, separationDate: r.separation_date, monthlySalary: r.basic_rate ?? 0, workSchedule: r.work_schedule ?? "",
     },
     createdAt: r.created_at,
     faceEnrolled: r.face_enrolled,
@@ -74,7 +78,15 @@ function employeeJson(r: any) {
 
 const employeeRow = async (db: Db, id: string) => (await db.query(`select * from employees where employee_id = $1`, [id])).rows[0];
 
+/** A job event as stored: a separation's reason and remarks are encrypted. Plain values pass through. */
+const eventJson = (e: any) => ({
+  ...e,
+  remarks: e.remarks ? open(e.remarks) : e.remarks,
+  changes: Array.isArray(e.changes) ? e.changes.map((ch: any) => ({ ...ch, ...(typeof ch?.to === "string" ? { to: open(ch.to) } : {}), ...(typeof ch?.from === "string" ? { from: open(ch.from) } : {}) })) : e.changes,
+});
+
 export async function loadState(s: Session) {
+  await separationsDue(pool);
   // Full records for everyone, an approver's team, or only yourself (the access matrix's People row).
   const scope = seenIds(s, "people");
   const me = s.employeeNo ?? "";
@@ -99,12 +111,20 @@ export async function loadState(s: Session) {
   // Roles with no People access (System Admin: our team) see only names and IDs, to link sign-ins.
   const noPeople = scopeOf(s, "view", "people") === null && !me;
   const namesOnly = noPeople && s.accountRole === "system_admin";
-  const emps = (noPeople && !namesOnly ? [] : employees.rows).map((r) => {
+  // Whoever runs payroll (Accounting) without People access gets pay details only: name, job and
+  // salary, government numbers and bank account, never the rest of the 201 file.
+  const payOnly = !full && scopeOf(s, "view", "payrollRuns") === "all" && scopeOf(s, "view", "people") === null;
+  const emps = (noPeople && !namesOnly && !payOnly ? [] : employees.rows).map((r) => {
+    if (payOnly && !isFull(r.employee_id)) {
+      const e = employeeJson(r);
+      return { ...e, personal: { firstName: e.personal.firstName, middleName: e.personal.middleName, lastName: e.personal.lastName, suffix: e.personal.suffix, birthDate: "", sex: "", civilStatus: "", nationality: e.personal.nationality },
+        contact: { workEmail: e.contact.workEmail, personalEmail: "", mobile: "", address: "", city: "", province: "", emergencyName: "", emergencyRelationship: "", emergencyPhone: "" } };
+    }
     if (namesOnly) {
       const e = employeeJson(r);
       return { ...e, personal: { firstName: e.personal.firstName, middleName: e.personal.middleName, lastName: e.personal.lastName, suffix: e.personal.suffix, birthDate: "", sex: "", civilStatus: "", nationality: "" },
         contact: { workEmail: "", personalEmail: "", mobile: "", address: "", city: "", province: "", emergencyName: "", emergencyRelationship: "", emergencyPhone: "" },
-        government: { sss: "", philhealth: "", pagibig: "", tin: "" }, job: { ...e.job, monthlySalary: 0 } };
+        government: { sss: "", philhealth: "", pagibig: "", tin: "" }, bank: undefined, job: { ...e.job, monthlySalary: 0 } };
     }
     const e = employeeJson(r);
     // Without People access, other people's records show only what a directory would.
@@ -114,11 +134,12 @@ export async function loadState(s: Session) {
       personal: { ...e.personal, birthDate: "", sex: "", civilStatus: "" },
       contact: { ...e.contact, personalEmail: "", address: "", city: "", province: "", emergencyName: "", emergencyRelationship: "", emergencyPhone: "" },
       government: { sss: "", philhealth: "", pagibig: "", tin: "" },
+      bank: undefined,
       job: { ...e.job, monthlySalary: pay ? e.job.monthlySalary : 0 },
     };
   });
   const posJson = positions.rows.map((p) => ({ ...p, employmentType: FROM.employment[p.employmentType] }));
-  return { units: clean(units.rows), positions: clean(posJson), employees: emps, documents: clean(documents.rows.map((d) => ({ ...d, referenceNo: d.referenceNo && open(d.referenceNo), fileName: d.fileName && open(d.fileName) }))), events: clean(events.rows), audit: clean(auditRows.rows) };
+  return { units: clean(units.rows), positions: clean(posJson), employees: emps, documents: clean(documents.rows.map((d) => ({ ...d, referenceNo: d.referenceNo && open(d.referenceNo), fileName: d.fileName && open(d.fileName) }))), events: clean(events.rows.map(eventJson)), audit: clean(auditRows.rows) };
 }
 
 // ---- Helpers ----
@@ -129,7 +150,7 @@ async function employeeOf(db: Db, id: string) {
   return r;
 }
 
-const nameOf = (r: { first_name: string; middle_name?: string | null; last_name: string; suffix?: string | null }) =>
+export const nameOf = (r: { first_name: string; middle_name?: string | null; last_name: string; suffix?: string | null }) =>
   [r.first_name, r.middle_name?.trim() ? `${r.middle_name.trim()[0]!.toUpperCase()}.` : "", r.last_name, r.suffix ?? ""].map((x) => x.trim()).filter(Boolean).join(" ");
 
 async function unitPath(db: Db, unitId: string) {
@@ -213,8 +234,20 @@ export async function createEmployee(s: Session, values: unknown) {
   });
 }
 
-type Section = "personal" | "contact" | "government";
-const SECTIONS: Record<Section, { title: string; schema: typeof personalSchema | typeof contactSchema | typeof governmentSchema; cols: Record<string, string>; labels: Record<string, string> }> = {
+type Section = "personal" | "contact" | "government" | "bank";
+
+/**
+ * Bank account: all three or none. The server checks the number itself (6 to 20 digits, spaces or
+ * dashes allowed): the shared bankSchema's pattern has a typo that refuses real numbers.
+ */
+const bankSection = z
+  .object({ bank: z.string().trim().max(60), accountName: z.string().trim().max(120), accountNumber: z.string().trim().refine((s) => !s || /^[\d -]{6,20}$/.test(s), "Account number should be 6 to 20 digits") })
+  .superRefine((b, ctx) => {
+    const filled = [b.bank, b.accountName, b.accountNumber].filter(Boolean).length;
+    if (filled > 0 && filled < 3) ctx.addIssue({ code: "custom", path: ["bank"], message: "Fill in all three, or leave all empty" });
+  });
+
+const SECTIONS: Record<Section, { title: string; schema: z.ZodType; cols: Record<string, string>; labels: Record<string, string> }> = {
   personal: {
     title: "Personal information", schema: personalSchema,
     cols: { firstName: "first_name", middleName: "middle_name", lastName: "last_name", suffix: "suffix", birthDate: "birth_date", sex: "sex", civilStatus: "civil_status", nationality: "nationality" },
@@ -224,6 +257,11 @@ const SECTIONS: Record<Section, { title: string; schema: typeof personalSchema |
     title: "Contact details", schema: contactSchema,
     cols: { workEmail: "email", personalEmail: "personal_email", mobile: "mobile_no", address: "address_line", city: "city", province: "province", emergencyName: "emergency_name", emergencyRelationship: "emergency_relationship", emergencyPhone: "emergency_phone" },
     labels: { workEmail: "Work email", personalEmail: "Personal email", mobile: "Mobile", address: "Address", city: "City", province: "Province", emergencyName: "Emergency contact", emergencyRelationship: "Relationship", emergencyPhone: "Emergency phone" },
+  },
+  bank: {
+    title: "Bank account", schema: bankSection,
+    cols: { bank: "bank_name", accountName: "bank_account_name", accountNumber: "bank_account_no" },
+    labels: { bank: "Bank", accountName: "Account name", accountNumber: "Account number" },
   },
   government: {
     title: "Government numbers", schema: governmentSchema,
@@ -253,17 +291,20 @@ export async function updateSection(s: Session, id: string, section: string, val
   return tx(async (c) => {
     const row = (await c.query(`select * from employees where employee_id = $1 for update`, [id])).rows[0];
     if (!row) throw new UserError("That employee no longer exists", 404);
-    const before = (employeeJson(row) as any)[section] as Record<string, string>;
+    const before = ((employeeJson(row) as any)[section] ?? {}) as Record<string, string>;
     if (selfContact && !can(s, "edit", "people", id) && (after.workEmail ?? "") !== (before.workEmail ?? "")) throw new UserError("Ask HR to change your work email");
     const changed = Object.keys(def.labels).filter((k) => (before[k] ?? "") !== (after[k] ?? ""));
     if (changed.length) {
-      // Government numbers are stored encrypted, each with its fingerprint (see crypto.ts).
+      // Government numbers are stored encrypted, each with its fingerprint; the bank account number
+      // encrypted (see crypto.ts).
       const pairs = changed.flatMap((k): [string, string | null][] =>
-        section === "government" ? [[def.cols[k]!, seal(after[k])], [`${def.cols[k]}_hash`, fingerprint(after[k])]] : [[def.cols[k]!, toDb(k, after[k] ?? "")]]);
+        section === "government" ? [[def.cols[k]!, seal(after[k])], [`${def.cols[k]}_hash`, fingerprint(after[k])]]
+          : section === "bank" && k === "accountNumber" ? [[def.cols[k]!, seal(after[k])]]
+          : [[def.cols[k]!, toDb(k, after[k] ?? "")]]);
       const sets = pairs.map(([col], i) => `${col} = $${i + 2}`).join(", ");
       await c.query(`update employees set ${sets}, updated_at = now() where employee_id = $1`, [id, ...pairs.map(([, v]) => v)]);
       // Sensitive values are named in the trail, never written into it.
-      const summary = section === "government" ? `Changed ${changed.map((k) => def.labels[k]).join(", ")}` : changed.map((k) => `${def.labels[k]}: ${before[k] || "—"} → ${after[k] || "—"}`).join("; ");
+      const summary = section === "government" || section === "bank" ? `Changed ${changed.map((k) => def.labels[k]).join(", ")}` : changed.map((k) => `${def.labels[k]}: ${before[k] || "—"} → ${after[k] || "—"}`).join("; ");
       await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: def.title, employeeNo: id, detail: summary });
     }
     return employeeJson(await employeeRow(c, id));
@@ -502,5 +543,75 @@ export async function updateDocument(s: Session, id: string, action: any) {
       default:
         throw new UserError("Unknown document action");
     }
+  });
+}
+
+// ---- Separation ----
+
+/** Today in the Philippines (the database server's clock, not the browser's). */
+const todayPh = async (db: Db) => (await db.query(`select to_char(now() at time zone 'Asia/Manila', 'YYYY-MM-DD') as d`)).rows[0].d as string;
+
+/** Turns off the sign-ins of someone whose last day has passed. */
+async function closeAccounts(c: Db, employeeIds: string[], actor: { id?: string; name: string }) {
+  if (!employeeIds.length) return;
+  const { rows } = await c.query(`update user_accounts set status = 'disabled' where employee_id = any($1) and status = 'active' returning username, employee_id`, [employeeIds]);
+  for (const a of rows) await audit(c, { actorId: actor.id, actorName: actor.name, module: "Administration", action: "Turned off sign-in", target: a.username, employeeNo: a.employee_id, detail: "Last day has passed" });
+}
+
+/**
+ * Someone HR recorded as leaving ahead of time becomes separated after their last day: off payroll
+ * and headcount, and their sign-in stops working. Run when Core HR loads and before each sign-in.
+ */
+export async function separationsDue(db: Db = pool) {
+  const due = (await db.query(`select 1 from employees where separation_date < (now() at time zone 'Asia/Manila')::date and record_status <> 'SEPARATED' limit 1`)).rowCount;
+  if (!due) return;
+  await tx(async (c) => {
+    const { rows } = await c.query(
+      `update employees set record_status = 'SEPARATED', updated_at = now() where separation_date < (now() at time zone 'Asia/Manila')::date and record_status <> 'SEPARATED' returning employee_id`,
+    );
+    await closeAccounts(c, rows.map((r) => r.employee_id as string), { name: "HeyHR" });
+    for (const r of rows) await audit(c, { actorName: "HeyHR", module: "People", action: "Edited", target: "Employment", employeeNo: r.employee_id, detail: "Status: Separated (last day passed)" });
+  });
+}
+
+/**
+ * HR records that someone is leaving: their last day and why. After the last day they're separated
+ * (off payroll and headcount, their sign-in stops working); before it they're shown as leaving.
+ * Accounting gets a final pay case right away. The reason and note are encrypted in job_events.
+ */
+export async function recordSeparation(s: Session, id: string, body: any) {
+  demand(s, "edit", "people", id);
+  const lastDay = String(body?.lastDay ?? ""), reason = String(body?.reason ?? ""), note = String(body?.note ?? "").trim();
+  return tx(async (c) => {
+    const e = (await c.query(`select * from employees where employee_id = $1 for update`, [id])).rows[0];
+    if (!e) throw new UserError("That employee no longer exists", 404);
+    if (e.record_status === "SEPARATED") throw new UserError("This employee is already separated");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(lastDay)) throw new UserError("Enter their last day");
+    if (lastDay < e.date_hired) throw new UserError("The last day can't be before they were hired");
+    if (!(SEPARATION_REASONS as readonly string[]).includes(reason)) throw new UserError("Choose why they're leaving");
+    const done = lastDay < (await todayPh(c));
+    await c.query(`update employees set separation_date = $2, record_status = case when $3::boolean then 'SEPARATED' else record_status end, updated_at = now() where employee_id = $1`, [id, lastDay, done]);
+    await c.query(
+      `insert into job_events (employee_id, event_kind, effective_date, changes, remarks, recorded_by, recorded_by_name) values ($1, 'Separation', $2, $3, $4, $5, $6)`,
+      [id, lastDay, JSON.stringify([{ label: "Reason", to: seal(reason) }, { label: "Last day", to: lastDay }]), seal(note), s.accountId, s.name],
+    );
+    await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: "Employment", employeeNo: id, detail: `Separation recorded: ${reason}, last day ${lastDay}` });
+    if (done) await closeAccounts(c, [id], { id: s.accountId, name: s.name });
+    await ensureCase(c, s, id, lastDay, reason);
+    return employeeJson(await employeeRow(c, id));
+  });
+}
+
+/** Undo a separation recorded by mistake, or a resignation that was withdrawn. */
+export async function cancelSeparation(s: Session, id: string) {
+  demand(s, "edit", "people", id);
+  return tx(async (c) => {
+    const e = (await c.query(`select * from employees where employee_id = $1 for update`, [id])).rows[0];
+    if (!e?.separation_date) throw new UserError("There's no separation to cancel");
+    await c.query(`update employees set separation_date = null, record_status = case when record_status = 'SEPARATED' then 'ACTIVE' else record_status end, updated_at = now() where employee_id = $1`, [id]);
+    await c.query(`delete from job_events where employee_id = $1 and event_kind = 'Separation' and effective_date = $2`, [id, e.separation_date]);
+    await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: "Employment", employeeNo: id, detail: `Separation cancelled (last day was ${e.separation_date})` });
+    await dropCase(c, id);
+    return employeeJson(await employeeRow(c, id));
   });
 }

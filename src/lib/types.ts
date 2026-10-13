@@ -65,7 +65,7 @@ export interface AttendancePoint {
 }
 
 export interface OfficeHeadcount {
-  office: "Cebu HQ" | "Manila" | "Davao";
+  office: string;
   count: number;
 }
 
@@ -84,7 +84,7 @@ export interface ComplianceItem {
 }
 
 export interface OnboardingStage {
-  stage: "Offer accepted" | "Documents submitted" | "Day 1 setup";
+  stage: string;
   count: number;
 }
 
@@ -92,7 +92,10 @@ export interface AdminOverviewStats {
   totalHeadcount: number;
   newHiresThisMonth: number;
   attritionRateYtd: number;
-  openPositions: { audit: number; tax: number; legal: number };
+  separationsYtd: number;
+  openPositions: { total: number; byDepartment: { name: string; count: number }[] };
+  onLeaveToday: number;
+  /** Monthly salaries of everyone employed now. */
   payrollRunTotal: number;
   payrollCutoffLabel: string;
 }
@@ -173,7 +176,7 @@ export interface DtrLogEntry {
   method: AttendanceMethod;
 }
 
-export type CertificateRequestStatus = "Pending" | "Ready for pickup" | "Released";
+export type CertificateRequestStatus = "Pending" | "Ready for pickup" | "Released" | "Declined";
 
 export interface CertificateRequest {
   id: string;
@@ -181,6 +184,18 @@ export interface CertificateRequest {
   purpose: string;
   status: CertificateRequestStatus;
   requestedOn: string;
+  /** Who asked (missing on very old demo requests). */
+  employeeId?: string;
+  employeeName?: string;
+  /** The last step HR took (issued, ready for pickup, released, declined). */
+  handledBy?: string;
+  handledAt?: string;
+  /** How it reached the employee: a digital copy to download, or a signed copy picked up from HR. */
+  delivery?: "digital" | "pickup";
+  /** Why HR declined it. */
+  note?: string;
+  /** The copy filed when HR issued it: what the employee received, kept on record for HR. */
+  issued?: { number: string; statement: string; purpose: string; issuedAt: string; issuedBy: string };
 }
 
 export type OffboardingStage = "Resignation filed" | "Clearance in progress" | "Final pay released";

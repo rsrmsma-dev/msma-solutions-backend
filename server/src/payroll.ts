@@ -8,7 +8,9 @@
 import { BUILT_IN_RATES, rateProblem } from "../../src/lib/pay/rateRules";
 import type { Agency, RateVersion } from "../../src/lib/reports/statutory";
 import { audit, demand, scopeOf, type Session } from "./auth";
+import { open, seal } from "./crypto";
 import { pool, tx, UserError, type Db } from "./db";
+import { automaticItems, sameItems, storeAutomatic } from "./loans";
 
 const AGENCIES: Agency[] = ["sss", "philhealth", "pagibig", "bir"];
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null) ?? undefined);
@@ -83,12 +85,17 @@ async function runJson(db: Db, run: any) {
     db.query(`select computation from payroll_run_lines where payroll_run_id = $1`, [run.id]),
     db.query(`select * from payroll_adjustments where payroll_run_id = $1 order by label`, [run.id]),
   ]);
+  // Added by hand, and added by payroll itself (loan installments, reimbursements: "loan-<id>", "claim-<id>").
   const adjustments: Record<string, unknown[]> = {};
-  for (const a of adjs.rows) (adjustments[a.employee_id] ??= []).push({ id: a.id, label: a.label, amount: a.amount, taxable: a.is_taxable, reason: a.reason });
+  const auto: Record<string, unknown[]> = {};
+  for (const a of adjs.rows) {
+    if (a.is_automatic) (auto[a.employee_id] ??= []).push({ id: a.loan_id ? `loan-${a.loan_id}` : a.reimbursement_claim_id ? `claim-${a.reimbursement_claim_id}` : `auto-${a.id}`, label: a.label, amount: a.amount, taxable: a.is_taxable, reason: open(a.reason) });
+    else (adjustments[a.employee_id] ??= []).push({ id: a.id, label: a.label, amount: a.amount, taxable: a.is_taxable, reason: a.reason });
+  }
   return {
     id: run.id, label: run.label, from: run.period_from, to: run.period_to, status: run.status,
     lines: lines.rows.map((l) => l.computation).sort((a: any, b: any) => String(a.person?.name).localeCompare(String(b.person?.name))),
-    adjustments, createdBy: run.created_by_name, createdAt: iso(run.created_at), computedAt: iso(run.computed_at),
+    adjustments, auto, createdBy: run.created_by_name, createdAt: iso(run.created_at), computedAt: iso(run.computed_at),
     ...(run.approved_at ? { approvedBy: run.approved_by_name, approvedAt: iso(run.approved_at) } : {}),
   };
 }
@@ -112,8 +119,10 @@ async function checkLines(c: Db, lines: unknown) {
     if (l.gross < 0 || l.tax < 0) throw new UserError("A payroll line has a negative gross pay or tax. Refresh and try again.");
   }
   if (ids.size) {
-    const found = (await c.query(`select employee_id from employees where employee_id = any($1)`, [[...ids]])).rows.length;
-    if (found !== ids.size) throw new UserError("A payroll line is for an employee who no longer exists. Refresh and try again.");
+    const found = (await c.query(`select employee_id, basic_rate from employees where employee_id = any($1)`, [[...ids]])).rows;
+    if (found.length !== ids.size) throw new UserError("A payroll line is for an employee who no longer exists. Refresh and try again.");
+    // People whose basic pay isn't filled in yet aren't on a run until it is.
+    if (found.some((e) => e.basic_rate === null)) throw new UserError("A payroll line is for someone whose basic pay isn't filled in yet. Refresh and try again.");
   }
   return lines as any[];
 }
@@ -121,7 +130,7 @@ async function checkLines(c: Db, lines: unknown) {
 /** Replaces a draft's lines. People with adjustments must stay in the run. */
 async function saveLines(c: Db, runId: string, lines: any[]) {
   const ids = lines.map((l) => l.person.id as string);
-  const kept = (await c.query(`select distinct employee_id from payroll_adjustments where payroll_run_id = $1 and not (employee_id = any($2))`, [runId, ids])).rows;
+  const kept = (await c.query(`select distinct employee_id from payroll_adjustments where payroll_run_id = $1 and not is_automatic and not (employee_id = any($2))`, [runId, ids])).rows;
   if (kept.length) throw new UserError("Someone with a pay adjustment is missing from the run. Remove their adjustment first.");
   await c.query(`delete from payroll_run_lines where payroll_run_id = $1 and not (employee_id = any($2))`, [runId, ids]);
   for (const l of lines) {
@@ -133,6 +142,21 @@ async function saveLines(c: Db, runId: string, lines: any[]) {
     );
   }
   await c.query(`update payroll_runs set computed_at = now() where id = $1`, [runId]);
+}
+
+/**
+ * Saves a draft's lines with the loan installments and reimbursements payroll adds by itself. The
+ * website sends the ones it computed pay with (`auto`); they must match what the database holds now.
+ */
+async function saveRun(c: Db, run: { id: string; period_to: string }, lines: any[], sentAuto: unknown) {
+  // One run at a time, so two runs can't both take the same installment or reimbursement.
+  await c.query(`select pg_advisory_xact_lock(hashtext('payroll-automatic-items'))`);
+  await c.query(`delete from payroll_adjustments where payroll_run_id = $1 and is_automatic`, [run.id]);
+  await saveLines(c, run.id, lines);
+  const items = await automaticItems(c, { id: run.id, to: run.period_to }, new Set(lines.map((l) => l.person.id as string)));
+  sameItems(items, sentAuto);
+  await storeAutomatic(c, run.id, items);
+  return items;
 }
 
 /** Whole runs are for those who work on payroll (Accounting, Super Admin); employees get their payslips. */
@@ -163,7 +187,7 @@ export async function createRun(s: Session, body: any) {
       `insert into payroll_runs (label, period_from, period_to, created_by, created_by_name) values ($1,$2,$3,$4,$5) returning *`,
       [label, from, to, s.accountId, s.name],
     );
-    await saveLines(c, run.id, lines);
+    await saveRun(c, run, lines, body?.auto);
     await log(c, s, "Started payroll run", label, `${lines.length} employees`);
     return runJson(c, await runRow(c, run.id));
   });
@@ -180,7 +204,7 @@ export async function refreshRun(s: Session, id: string, body: any) {
   demand(s, "edit", "payrollRuns");
   return tx(async (c) => {
     const r = await draftRow(c, id, "This run is approved and locked");
-    await saveLines(c, r.id, await checkLines(c, body?.lines));
+    await saveRun(c, r, await checkLines(c, body?.lines), body?.auto);
     return runJson(c, await runRow(c, r.id));
   });
 }
@@ -197,7 +221,7 @@ export async function addAdjustment(s: Session, id: string, body: any) {
     const r = await draftRow(c, id, "This run is approved and locked. Add the correction to the next run.");
     const lines = await checkLines(c, body?.lines);
     if (!lines.some((l) => l.person.id === employeeId)) throw new UserError("That employee isn't in this run");
-    await saveLines(c, r.id, lines);
+    await saveRun(c, r, lines, body?.auto);
     await c.query(
       `insert into payroll_adjustments (payroll_run_id, employee_id, label, amount, is_taxable, reason) values ($1,$2,$3,$4,$5,$6)`,
       [r.id, employeeId, label, amount, !!body?.taxable, reason],
@@ -211,9 +235,9 @@ export async function removeAdjustment(s: Session, id: string, adjustmentId: str
   demand(s, "edit", "payrollRuns");
   return tx(async (c) => {
     const r = await draftRow(c, id, "This run is approved and locked");
-    const { rowCount } = await c.query(`delete from payroll_adjustments where payroll_run_id = $1 and id::text = $2`, [r.id, adjustmentId]);
+    const { rowCount } = await c.query(`delete from payroll_adjustments where payroll_run_id = $1 and id::text = $2 and not is_automatic`, [r.id, adjustmentId]);
     if (!rowCount) throw new UserError("That adjustment no longer exists", 404);
-    await saveLines(c, r.id, await checkLines(c, body?.lines));
+    await saveRun(c, r, await checkLines(c, body?.lines), body?.auto);
     await log(c, s, "Removed pay adjustment", r.label);
     return runJson(c, await runRow(c, r.id));
   });
@@ -225,7 +249,15 @@ export async function approveRun(s: Session, id: string, body: any) {
   return tx(async (c) => {
     const r = await draftRow(c, id, "This run is already approved");
     const lines = await checkLines(c, body?.lines);
-    await saveLines(c, r.id, lines);
+    const items = await saveRun(c, r, lines, body?.auto);
+    // Reimbursements in this run are now paid, with this payroll.
+    const claimIds = Object.values(items).flat().flatMap((a) => (a.claimId ? [a.claimId] : []));
+    if (claimIds.length) {
+      await c.query(
+        `update reimbursement_claims set paid_at = now(), paid_by = $2, paid_by_name = $3, payout_method = 'payroll', payout_reference = $4 where id = any($1::uuid[]) and paid_at is null`,
+        [claimIds, s.accountId, s.name, seal(r.label)],
+      );
+    }
     await c.query(`update payroll_runs set status = 'approved', approved_by = $2, approved_by_name = $3, approved_at = now(), payslips_released_at = now() where id = $1`, [r.id, s.accountId, s.name]);
     const total = lines.reduce((n, l) => n + l.net, 0);
     await log(c, s, "Approved payroll run", r.label, `${lines.length} employees · take-home ₱${total.toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
@@ -237,6 +269,7 @@ export async function deleteRun(s: Session, id: string) {
   demand(s, "delete", "payrollRuns");
   return tx(async (c) => {
     const r = await draftRow(c, id, "Approved runs stay on record");
+    await c.query(`delete from payroll_adjustments where payroll_run_id = $1`, [r.id]);
     await c.query(`delete from payroll_runs where id = $1`, [r.id]);
     await log(c, s, "Deleted draft payroll run", r.label);
   });

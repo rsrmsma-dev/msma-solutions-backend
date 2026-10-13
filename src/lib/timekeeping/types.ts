@@ -40,6 +40,8 @@ export interface Punch {
   deviceRegistered: boolean;
   /** Face recognition match, 0–100. */
   match?: number;
+  /** Where a clock-in from home was made (the phone's GPS), or why it's missing. */
+  location?: { lat: number; lng: number; accuracy: number } | { unavailable: string };
   /** Manual corrections only. */
   reason?: string;
   recordedBy?: string;

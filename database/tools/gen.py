@@ -79,7 +79,7 @@ for d in DOMAINS:
             body.append(s)
             if c["fk"]:
                 tgt, tcol = c["fk"]
-                if (name in ("remote_work_day_branches", "approval_workflow_steps", "payroll_run_lines") and c["pk"] and tgt != "employees") or name in ("user_sessions", "mfa_backup_codes"):
+                if (name in ("remote_work_day_branches", "holiday_rule_branches", "approval_workflow_steps", "payroll_run_lines") and c["pk"] and tgt != "employees") or name in ("user_sessions", "mfa_backup_codes", "user_preferences") or (name, c["name"]) == ("holiday_changes", "holiday_rule_id"):
                     ondel = "CASCADE"  # rows that only exist as part of their parent
                 elif not (c["nn"] or c["pk"]):
                     ondel = "SET NULL"
@@ -115,9 +115,20 @@ lines += ["-- Extra integrity rules",
 "ALTER TABLE contribution_rate_versions ADD UNIQUE (agency, effective_from);",
 "ALTER TABLE subscriptions ADD CHECK (seat_limit IS NULL OR seat_limit > 0);",
 "ALTER TABLE subscriptions ADD CHECK (price_per_seat IS NULL OR price_per_seat >= 0);",
+"ALTER TABLE loans ADD CHECK (principal > 0 AND installment > 0 AND installment <= principal);",
+"ALTER TABLE final_pay_cases ADD CHECK (released_at IS NULL OR (release_items IS NOT NULL AND release_total IS NOT NULL));",
+"ALTER TABLE reimbursement_claims ADD CHECK ((paid_at IS NULL) = (payout_method IS NULL));",
+"ALTER TABLE company_settings ADD CHECK (leave_default_carry_over BETWEEN 0 AND 365 AND overtime_threshold_minutes BETWEEN 0 AND 240 AND default_break_minutes BETWEEN 0 AND 120 AND schedule_publish_lead_days BETWEEN 0 AND 60);",
+"ALTER TABLE holiday_rules ADD CHECK ((repeat_kind = 'fixed' AND repeat_month BETWEEN 1 AND 12 AND repeat_day BETWEEN 1 AND 31 AND once_date IS NULL) OR (repeat_kind = 'once' AND once_date IS NOT NULL AND repeat_month IS NULL AND repeat_day IS NULL));",
+"ALTER TABLE holiday_changes ADD CHECK ((builtin_rule_id IS NULL) <> (holiday_rule_id IS NULL));",
+"ALTER TABLE holiday_changes ADD CHECK ((change_kind = 'cancel' AND new_date IS NULL) OR (change_kind = 'move' AND new_date IS NOT NULL AND extract(year FROM new_date) = year));",
+"ALTER TABLE holiday_changes ADD UNIQUE (builtin_rule_id, year);",
+"ALTER TABLE holiday_changes ADD UNIQUE (holiday_rule_id, year);",
+"ALTER TABLE company_policies ADD CHECK (version >= 1);",
+"CREATE UNIQUE INDEX company_policies_title_ci ON company_policies (lower(title)) WHERE status <> 'archived';",
 "",
 "-- New Employees Template rules (BRD v1.1, 11.2.1)",
-"ALTER TABLE employees ADD CONSTRAINT employees_names_letters CHECK (last_name ~ $re$^[[:alpha:] .'-]+$$re$ AND first_name ~ $re$^[[:alpha:] .'-]+$$re$ AND (middle_name IS NULL OR middle_name ~ $re$^[[:alpha:] .'-]+$$re$));",
+"ALTER TABLE employees ADD CONSTRAINT employees_names_letters CHECK (last_name ~ $re$^[[:alpha:] .'-]*$$re$ AND first_name ~ $re$^[[:alpha:] .'-]+$$re$ AND (middle_name IS NULL OR middle_name ~ $re$^[[:alpha:] .'-]+$$re$));",
 "ALTER TABLE employees ADD CONSTRAINT employees_mobile_format CHECK (mobile_no ~ '^09[0-9]{9}$');",
 "ALTER TABLE employees ADD CONSTRAINT employees_email_format CHECK (email ~* $re$^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$$re$);",
 "ALTER TABLE employees ADD CONSTRAINT employees_basic_rate_positive CHECK (basic_rate > 0);",

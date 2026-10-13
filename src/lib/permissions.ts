@@ -29,11 +29,11 @@ export const ROLE_LABEL: Record<RoleKey, string> = {
 };
 
 export const ROLE_DESCRIPTION: Record<RoleKey, string> = {
-  system_admin: "Our development team. Plan and seats, and setting up a client's first Super Admin. No access to client data.",
+  system_admin: "Our team, for maintenance only: the client's subscription and seats, support tickets, and user accounts and roles. No access to HR, pay or attendance data.",
   super_admin: "The client, usually their IT. Full access within the company; handles the initial setup.",
-  hr: "HR staff. Employee records, leave, attendance setup and rules. Views payroll reports; never sees claims.",
-  approver: "Managers and supervisors. Approve their own team's claims, overtime, undertime and time adjustments.",
-  accounting: "Accountants. Prepare and give final approval on payroll; final approval and payout of claims.",
+  hr: "HR staff. Employee records, leave setup and balances, attendance setup and rules. Views leave and payroll reports; never sees claims.",
+  approver: "Managers and supervisors. Approve their own team's leave, claims, overtime, undertime and time adjustments.",
+  accounting: "Accountants. Reimbursements and payroll only: final approval and payout of claims, and preparing and finalizing payroll. Sees pay details (salary, government numbers) under Payroll, not the 201 file, and the attendance payroll needs.",
   employee: "Regular employees. File leave and claims and see their own records.",
 };
 
@@ -43,32 +43,36 @@ type Row = Record<RoleKey, Cell>;
 /** Features (rows of the approved access matrix). */
 export const PERMISSIONS = {
   dashboard: { label: "Home dashboard", system_admin: "none", super_admin: "full", hr: "view", approver: "view:team", accounting: "view", employee: "own" },
-  people: { label: "Maintenance › People (incl. 201 file)", system_admin: "none", super_admin: "full", hr: "full", approver: "view:team", accounting: "view", employee: "own" },
-  departments: { label: "Maintenance › Departments", system_admin: "none", super_admin: "full", hr: "full", approver: "view", accounting: "view", employee: "none" },
-  locations: { label: "Maintenance › Locations", system_admin: "none", super_admin: "full", hr: "full", approver: "view", accounting: "view", employee: "none" },
-  orgChart: { label: "Maintenance › Org chart", system_admin: "none", super_admin: "full", hr: "full", approver: "view", accounting: "view", employee: "none" },
+  people: { label: "Maintenance › People (incl. 201 file)", system_admin: "none", super_admin: "full", hr: "full", approver: "view:team", accounting: "none", employee: "own" },
+  departments: { label: "Maintenance › Departments", system_admin: "none", super_admin: "full", hr: "full", approver: "view", accounting: "none", employee: "none" },
+  locations: { label: "Maintenance › Locations", system_admin: "none", super_admin: "full", hr: "full", approver: "view", accounting: "none", employee: "none" },
+  orgChart: { label: "Maintenance › Org chart", system_admin: "none", super_admin: "full", hr: "full", approver: "view", accounting: "none", employee: "none" },
   documents: { label: "Maintenance › Documents", system_admin: "none", super_admin: "full", hr: "full", approver: "view:team", accounting: "none", employee: "own" },
   leaveTypes: { label: "Maintenance › Leave types", system_admin: "none", super_admin: "full", hr: "full", approver: "none", accounting: "none", employee: "none" },
   leaveBalances: { label: "Leave balances and adjustments", system_admin: "none", super_admin: "full", hr: "full", approver: "view:team", accounting: "none", employee: "own" },
-  leave: { label: "Leave applications", system_admin: "none", super_admin: "full", hr: "approve", approver: "view:team", accounting: "none", employee: "own" },
+  leave: { label: "Leave applications", system_admin: "none", super_admin: "full", hr: "view", approver: "approve:team", accounting: "none", employee: "own" },
   attendanceSettings: { label: "Attendance settings (Shifts, Schedules)", system_admin: "none", super_admin: "full", hr: "full", approver: "none", accounting: "none", employee: "none" },
-  remoteDays: { label: "Attendance › Remote work days", system_admin: "none", super_admin: "full", hr: "full", approver: "view:team", accounting: "none", employee: "view" },
+  remoteDays: { label: "Attendance › Remote work days", system_admin: "none", super_admin: "full", hr: "none", approver: "view:team", accounting: "none", employee: "view" },
   rules: { label: "Maintenance › Rules", system_admin: "none", super_admin: "full", hr: "full", approver: "none", accounting: "none", employee: "none" },
   payrollRuns: { label: "Payroll runs", system_admin: "none", super_admin: "full", hr: "none", approver: "none", accounting: "manage+final", employee: "own" },
   payrollReports: { label: "Payroll reports (Payroll report, Government reports)", system_admin: "none", super_admin: "full", hr: "view", approver: "none", accounting: "manage", employee: "none" },
   contributions: { label: "Government contributions (rate tables)", system_admin: "none", super_admin: "full", hr: "none", approver: "none", accounting: "manage", employee: "none" },
   claims: { label: "Requests › Claims / Reimbursements", system_admin: "none", super_admin: "full", hr: "none", approver: "approve:team", accounting: "final", employee: "own" },
   attendanceRecords: { label: "Reports (attendance logs, overtime, undertime, time adjustments, tardiness)", system_admin: "none", super_admin: "full", hr: "view", approver: "approve:team", accounting: "view", employee: "own" },
-  analytics: { label: "Reports › HR, Attendance, Management", system_admin: "none", super_admin: "full", hr: "view", approver: "view:team", accounting: "view", employee: "none" },
+  analytics: { label: "Reports › HR, Attendance, Management", system_admin: "none", super_admin: "full", hr: "view", approver: "view:team", accounting: "none", employee: "none" },
   trainings: { label: "Onboarding › Trainings", system_admin: "none", super_admin: "full", hr: "full", approver: "view:team", accounting: "none", employee: "own" },
   partnerTools: { label: "Partner tools (team calendar, workforce, performance, cases)", system_admin: "none", super_admin: "full", hr: "view", approver: "manage:team", accounting: "none", employee: "none" },
   selfService: { label: "Employee self-service (certificates, HMO & benefits)", system_admin: "none", super_admin: "full", hr: "manage", approver: "none", accounting: "none", employee: "own" },
   announcements: { label: "Announcements", system_admin: "none", super_admin: "full", hr: "manage", approver: "view", accounting: "view", employee: "view" },
+  userAccounts: { label: "Maintenance › User accounts (sign-in details of every account)", system_admin: "none", super_admin: "full", hr: "none", approver: "none", accounting: "none", employee: "none" },
   roleAssignment: { label: "Role assignment (Users)", system_admin: "manage", super_admin: "full", hr: "none", approver: "none", accounting: "none", employee: "none" },
   audit: { label: "Audit trail", system_admin: "view", super_admin: "view", hr: "view", approver: "none", accounting: "view", employee: "none" },
   systemSettings: { label: "System settings (company details, sign-in rules)", system_admin: "none", super_admin: "full", hr: "none", approver: "none", accounting: "none", employee: "none" },
   personalSettings: { label: "Personal settings", system_admin: "own", super_admin: "own", hr: "own", approver: "own", accounting: "own", employee: "own" },
-  subscription: { label: "Subscription plan & seat count", system_admin: "full", super_admin: "view", hr: "view", approver: "none", accounting: "none", employee: "none" },
+  subscription: { label: "Subscription plan & seat count (own company)", system_admin: "full", super_admin: "view", hr: "view", approver: "none", accounting: "none", employee: "none" },
+  subscriptionUpgrade: { label: "Request a subscription upgrade", system_admin: "view", super_admin: "manage", hr: "none", approver: "none", accounting: "none", employee: "none" },
+  clients: { label: "Clients & Subscriptions (plans, seat overrides, extensions)", system_admin: "full", super_admin: "none", hr: "none", approver: "none", accounting: "none", employee: "none" },
+  support: { label: "Support tickets (report a problem to us)", system_admin: "full", super_admin: "own", hr: "own", approver: "none", accounting: "own", employee: "none" },
 } satisfies Record<string, Row & { label: string }>;
 
 export type Feature = keyof typeof PERMISSIONS;
@@ -76,9 +80,9 @@ export const FEATURES = Object.keys(PERMISSIONS) as Feature[];
 
 /** Narrower rules that sit inside a cell. */
 export const LIMITS = {
-  /** Roles a role may give on the Users screen. system_admin only sets up a client's Super Admin. */
+  /** Roles a role may give on the Users screen. system_admin creates and maintains every account. */
   assignableRoles: {
-    system_admin: ["super_admin"],
+    system_admin: ["system_admin", "super_admin", "hr", "approver", "accounting", "employee"],
     super_admin: ["super_admin", "hr", "approver", "accounting", "employee"],
     hr: [],
     approver: [],
@@ -87,7 +91,7 @@ export const LIMITS = {
   } as Record<RoleKey, RoleKey[]>,
   /** Audit trail areas each role sees ("all" = everything). */
   auditAreas: {
-    system_admin: ["Sign-in", "Administration"],
+    system_admin: ["Sign-in", "Administration", "Support"],
     super_admin: "all",
     hr: ["People", "Timekeeping", "Leave"],
     approver: [],

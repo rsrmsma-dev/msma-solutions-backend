@@ -15,6 +15,25 @@ export const governmentSchema = z.object({
   tin: optionalPattern([9, 12], "TIN"),
 });
 
+export const BANKS = ["BDO Unibank", "BPI", "Metrobank", "Landbank", "PNB", "Security Bank", "UnionBank", "RCBC", "China Bank", "EastWest Bank", "GCash", "Maya", "Other"] as const;
+
+/** All three or none: a half-filled account can't receive pay. */
+export const bankSchema = z
+  .object({
+    bank: z.string().trim(),
+    accountName: z.string().trim(),
+    accountNumber: z
+      .string()
+      .trim()
+      .refine((s) => !s || /^[d -]{6,20}$/.test(s), "Account number should be 6 to 20 digits"),
+  })
+  .superRefine((b, ctx) => {
+    const filled = [b.bank, b.accountName, b.accountNumber].filter(Boolean).length;
+    if (filled > 0 && filled < 3) {
+      for (const k of ["bank", "accountName", "accountNumber"] as const) if (!b[k]) ctx.addIssue({ code: "custom", path: [k], message: "Fill in all three, or leave all empty" });
+    }
+  });
+
 const today = () => new Date().toISOString().slice(0, 10);
 
 // Rules from the New Employees Template (BRD v1.1, 11.2.1); the database enforces the same ones.

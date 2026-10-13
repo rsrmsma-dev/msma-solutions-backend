@@ -7,8 +7,8 @@ import { createHash } from "node:crypto";
 import { claimProblems, type ClaimInput } from "../../src/lib/reimbursements/rules";
 import { CATEGORIES } from "../../src/lib/reimbursements/store";
 import { audit, can, demand, seen, type Session } from "./auth";
-import { clean, pool, tx, UserError, type Db } from "./db";
-import { openBytes, seal, sealBytes } from "./crypto";
+import { clean, pool, schema020, tx, UserError, type Db } from "./db";
+import { open, openBytes, seal, sealBytes } from "./crypto";
 
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null) ?? undefined);
 const MAX_RECEIPT_BYTES = 4 * 1024 * 1024;
@@ -18,6 +18,7 @@ const claimJson = (r: any) => clean({
   amount: r.amount, description: r.description, receipt: `/api/files/${r.receipt_file_id}`, status: r.status, filedAt: iso(r.filed_at),
   decidedBy: r.decided_by_name, decidedAt: iso(r.decided_at), note: r.decision_note,
   approverDecidedBy: r.approver_decided_by_name, approverDecidedAt: iso(r.approver_decided_at), approverNote: r.approver_note,
+  paidAt: iso(r.paid_at), paidBy: r.paid_by_name, payoutMethod: r.payout_method, payoutRef: r.payout_reference ? open(r.payout_reference) : null,
 });
 
 /** The claims they may see: their own, their team's (approvers), or everyone's (Accounting, Super Admin). */
@@ -100,6 +101,30 @@ export async function decideClaim(s: Session, id: string, approve: boolean, note
   });
 }
 
+/**
+ * Accounting pays approved claims by bank transfer instead of waiting for payroll (Final Approve on
+ * each). Claims left unpaid go out with the next payroll run. The reference is encrypted.
+ */
+export async function payClaimsByTransfer(s: Session, body: any) {
+  const ids = Array.isArray(body?.ids) ? body.ids.map(String) : [];
+  const reference = String(body?.reference ?? "").trim(), paidOn = String(body?.paidOn ?? "");
+  return tx(async (c) => {
+    const picked = ids.length ? (await c.query(`select * from reimbursement_claims where id::text = any($1) for update`, [ids])).rows : [];
+    for (const r of picked) demand(s, "final", "claims", r.employee_id);
+    if (!picked.length || picked.length !== new Set(ids).size) throw new UserError("Choose the claims to pay");
+    if (picked.some((r) => r.status !== "approved" || r.paid_at)) throw new UserError("Only approved claims that aren't paid yet can be paid out");
+    if (!reference) throw new UserError("Enter the transfer reference");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(paidOn)) throw new UserError("Enter the date it was sent");
+    await c.query(
+      `update reimbursement_claims set paid_at = ($2::date + time '12:00') at time zone 'Asia/Manila', paid_by = $3, paid_by_name = $4, payout_method = 'transfer', payout_reference = $5 where id = any($1::uuid[])`,
+      [picked.map((r) => r.id), paidOn, s.accountId, s.name, seal(reference)],
+    );
+    const total = Math.round(picked.reduce((n, r) => n + r.amount, 0) * 100) / 100;
+    for (const r of picked) await audit(c, { actorId: s.accountId, actorName: s.name, module: "Reimbursements", action: "Paid claim by transfer", target: r.merchant, employeeNo: r.employee_id, detail: `₱${r.amount.toLocaleString("en-PH")} · sent ${paidOn}` });
+    return { paid: picked.length, total };
+  });
+}
+
 /** A stored file, for whoever may see what it belongs to. */
 export async function readFile(s: Session, id: string, db: Db = pool) {
   const f = (await db.query(`select id, content_type, content from files where id::text = $1`, [id])).rows[0];
@@ -108,11 +133,14 @@ export async function readFile(s: Session, id: string, db: Db = pool) {
   const photo = (await db.query(`select 1 from employees where photo_file_id = $1 limit 1`, [f.id])).rowCount;
   const doc = (await db.query(`select employee_id from employee_documents where file_id = $1 limit 1`, [f.id])).rows[0];
   const logo = (await db.query(`select 1 from company_settings where logo_file_id = $1`, [f.id])).rowCount;
+  const policy = (await schema020(db)) ? (await db.query(`select status from company_policies where file_id = $1 order by (status = 'published') desc limit 1`, [f.id])).rows[0] : undefined;
   // Receipts: whoever may see the claim. Photos and the company logo: anyone signed in.
-  // 201 documents: whoever may see that person's documents.
+  // 201 documents: whoever may see that person's documents. Company policy documents: anyone signed
+  // in once published; drafts and archived ones only whoever has Rules access.
   const allowed = claim ? claim.employee_id === s.employeeNo || can(s, "view", "claims", claim.employee_id)
     : photo || logo ? true
     : doc ? can(s, "view", "documents", doc.employee_id)
+    : policy ? policy.status === "published" || can(s, "view", "rules")
     : false;
   if (!allowed) throw new UserError("That file isn't available", 404);
   return { contentType: f.content_type as string, bytes: openBytes(f.content as Buffer) };

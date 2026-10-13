@@ -8,6 +8,8 @@ import type { LeaveType } from "../../src/lib/leave/types";
 import { audit, can, demand, seenIds, type Session } from "./auth";
 import { clean, pool, tx, UserError, type Db } from "./db";
 import { getSettings } from "./admin";
+import { companyHolidays } from "./holidays";
+import { leavePolicy } from "./settings";
 import { open, seal } from "./crypto";
 
 export { DEFAULT_TYPES };
@@ -25,7 +27,8 @@ function typeJson(r: any): LeaveType {
 
 /**
  * Everything the rules look at, in the browser's shapes, with the company's work week (Settings >
- * Organization) so days are counted as the form counts them. Inside a transaction when deciding.
+ * Organization), leave policy (Settings > Time off & leave) and holiday calendar, so days are
+ * counted and requests checked as the form does. Inside a transaction when deciding.
  * One query at a time: inside a transaction the client can't run two at once.
  */
 async function loadData(db: Db): Promise<LeaveData> {
@@ -34,8 +37,12 @@ async function loadData(db: Db): Promise<LeaveData> {
   const adjustments = await db.query(`select * from leave_adjustments order by adjusted_at desc`);
   const carry = await db.query(`select * from leave_carry_overs where leave_year = $1`, [Number(isoToday().slice(0, 4))]);
   const { workWeek } = await getSettings(db);
+  const policy = await leavePolicy(db);
+  const holidays = await companyHolidays(db);
   return {
     workWeek,
+    policy,
+    holidays,
     types: types.rows.map(typeJson),
     requests: requests.rows.map((r) => clean({
       id: r.id, employeeId: r.employee_id, typeId: r.leave_type_id, start: r.date_from, end: r.date_to, halfDay: r.half_day, days: r.days,
@@ -53,11 +60,12 @@ async function facts(db: Db, employeeId: string): Promise<LeavePersonFacts | und
   if (!r) return undefined;
   const sex = r.sex === "M" ? "Male" : r.sex === "F" ? "Female" : "";
   const civil = r.civil_status ? r.civil_status[0] + r.civil_status.slice(1).toLowerCase() : "";
-  return { personal: { sex, civilStatus: civil }, job: { dateHired: r.date_hired } };
+  return { personal: { sex, civilStatus: civil }, job: { dateHired: r.date_hired ?? "" } };
 }
 
 export async function loadState(s: Session): Promise<LeaveData> {
-  const data = await loadData(pool);
+  // The browser has its own copy of the holiday calendar (GET /api/holidays).
+  const { holidays: _holidays, ...data } = await loadData(pool);
   const requests = seenIds(s, "leave");
   const balances = seenIds(s, "leaveBalances");
   if (requests === "all" && balances === "all") return data;

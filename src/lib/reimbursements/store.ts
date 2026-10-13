@@ -33,7 +33,18 @@ export interface Claim {
   decidedBy?: string;
   decidedAt?: string;
   note?: string;
+  /** Released by Accounting directly (cash, bank transfer, e-wallet or check), or in final pay.
+   *  "payroll" is only on older claims that went out with a payroll run. */
+  paidAt?: string;
+  paidBy?: string;
+  payoutMethod?: PayoutMethod | "payroll" | "final pay";
+  /** The receipt/transfer/check reference, the run label, or "Final pay". */
+  payoutRef?: string;
 }
+
+/** How Accounting hands the money over. Reimbursements never go through payroll. */
+export type PayoutMethod = "cash" | "transfer" | "e-wallet" | "check";
+export const PAYOUT_LABEL: Record<PayoutMethod | "payroll" | "final pay", string> = { cash: "Cash", transfer: "Bank transfer", "e-wallet": "GCash / e-wallet", check: "Check", payroll: "With payroll", "final pay": "In final pay" };
 
 /** The expense name to show: what they typed for "Other", else the category. */
 export const claimType = (c: Pick<Claim, "category" | "otherType">) => (c.category === "Other" && c.otherType ? c.otherType : c.category);

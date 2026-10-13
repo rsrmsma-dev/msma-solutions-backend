@@ -30,5 +30,3 @@ So the screens match the server:
    The server only lets HR touch Employee accounts.
 3. `src/lib/admin/api.ts` `listAccounts`: drop the "System Admin sees only Super Admin accounts"
    filter. The server already returns the right accounts for each role.
-4. Optional: add an `admin` role key ("Admin") if the screens should show it as its own role.
-   Until then it appears as a Super Admin named "Admin".
