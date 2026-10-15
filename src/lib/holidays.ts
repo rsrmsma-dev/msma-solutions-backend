@@ -206,6 +206,9 @@ const appliesTo = (h: Holiday, office?: string) => !h.offices?.length || (!!offi
 /** The holiday on a date. Pass the employee's office so local holidays count only there. */
 export const holidayOn = (date: string, office?: string) => HOLIDAYS.find((h) => h.date === date && appliesTo(h, office));
 
+/** Two regular holidays on one date (the workbook's DH / DRH day types). */
+export const isDoubleHoliday = (date: string, office?: string) => HOLIDAYS.filter((h) => h.date === date && h.type === "regular" && appliesTo(h, office)).length > 1;
+
 // ---- Maintenance (Holiday calendar page) ----
 
 const DELAY = 200;

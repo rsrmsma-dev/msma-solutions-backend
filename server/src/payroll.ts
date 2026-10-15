@@ -7,10 +7,11 @@
 
 import { BUILT_IN_RATES, rateProblem } from "../../src/lib/pay/rateRules";
 import type { Agency, RateVersion } from "../../src/lib/reports/statutory";
-import { audit, demand, scopeOf, type Session } from "./auth";
-import { open, seal } from "./crypto";
+import { audit, can, demand, scopeOf, type Session } from "./auth";
+import { open } from "./crypto";
 import { pool, tx, UserError, type Db } from "./db";
 import { automaticItems, sameItems, storeAutomatic } from "./loans";
+import { tellAssigned, tellEmployees } from "./notify";
 
 const AGENCIES: Agency[] = ["sss", "philhealth", "pagibig", "bir"];
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null) ?? undefined);
@@ -97,6 +98,7 @@ async function runJson(db: Db, run: any) {
     lines: lines.rows.map((l) => l.computation).sort((a: any, b: any) => String(a.person?.name).localeCompare(String(b.person?.name))),
     adjustments, auto, createdBy: run.created_by_name, createdAt: iso(run.created_at), computedAt: iso(run.computed_at),
     ...(run.approved_at ? { approvedBy: run.approved_by_name, approvedAt: iso(run.approved_at) } : {}),
+    ...(run.reviewed_at ? { reviewedBy: run.reviewed_by_name, reviewedAt: iso(run.reviewed_at) } : {}),
   };
 }
 
@@ -249,18 +251,27 @@ export async function approveRun(s: Session, id: string, body: any) {
   return tx(async (c) => {
     const r = await draftRow(c, id, "This run is already approved");
     const lines = await checkLines(c, body?.lines);
-    const items = await saveRun(c, r, lines, body?.auto);
-    // Reimbursements in this run are now paid, with this payroll.
-    const claimIds = Object.values(items).flat().flatMap((a) => (a.claimId ? [a.claimId] : []));
-    if (claimIds.length) {
-      await c.query(
-        `update reimbursement_claims set paid_at = now(), paid_by = $2, paid_by_name = $3, payout_method = 'payroll', payout_reference = $4 where id = any($1::uuid[]) and paid_at is null`,
-        [claimIds, s.accountId, s.name, seal(r.label)],
-      );
-    }
+    // Reimbursements are released by Accounting directly, never with payroll (reimbursements.ts).
+    await saveRun(c, r, lines, body?.auto);
     await c.query(`update payroll_runs set status = 'approved', approved_by = $2, approved_by_name = $3, approved_at = now(), payslips_released_at = now() where id = $1`, [r.id, s.accountId, s.name]);
     const total = lines.reduce((n, l) => n + l.net, 0);
     await log(c, s, "Approved payroll run", r.label, `${lines.length} employees · take-home ₱${total.toLocaleString("en-PH", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`);
+    await tellEmployees(c, s, lines.map((l) => l.person.id as string), "payslip", "update", `Your payslip for ${r.label} is ready`, "Open Payslips to see your take-home pay and deductions.");
+    await tellAssigned(c, s, "final", "payrollRuns", "payslip", "approved", `Payroll for ${r.label} was approved`, `${s.name} approved it and released ${lines.length} payslips.`);
+    return runJson(c, await runRow(c, r.id));
+  });
+}
+
+/** "Reviewed by" on the Summary sheet: whoever prepares or approves payroll signs off a draft. Needs migration 029. */
+export async function reviewRun(s: Session, id: string) {
+  if (!can(s, "final", "payrollRuns")) demand(s, "edit", "payrollRuns");
+  const has029 = (await pool.query(`select exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'payroll_runs' and column_name = 'reviewed_at') as ok`)).rows[0].ok === true;
+  if (!has029) throw new UserError("The database needs an update (migration 029) before a run can be marked reviewed. Ask your administrator to apply it.", 503);
+  return tx(async (c) => {
+    const r = await draftRow(c, id, "This run is already approved");
+    if (r.reviewed_at) throw new UserError(`Already reviewed by ${r.reviewed_by_name}`);
+    await c.query(`update payroll_runs set reviewed_by = $2, reviewed_by_name = $3, reviewed_at = now() where id = $1`, [r.id, s.accountId, s.name]);
+    await log(c, s, "Reviewed payroll run", r.label);
     return runJson(c, await runRow(c, r.id));
   });
 }
@@ -279,9 +290,9 @@ export async function deleteRun(s: Session, id: string) {
 export async function myPayslips(s: Session) {
   if (!s.employeeNo) return [];
   const { rows } = await pool.query(
-    `select r.id, r.label, r.period_from, r.period_to, l.computation from payroll_runs r join payroll_run_lines l on l.payroll_run_id = r.id
+    `select r.id, r.label, r.period_from, r.period_to, r.created_by_name, r.approved_by_name, l.computation from payroll_runs r join payroll_run_lines l on l.payroll_run_id = r.id
       where r.status = 'approved' and l.employee_id = $1 order by r.period_from desc`,
     [s.employeeNo],
   );
-  return rows.map((r) => ({ run: { id: r.id, label: r.label, from: r.period_from, to: r.period_to }, line: r.computation }));
+  return rows.map((r) => ({ run: { id: r.id, label: r.label, from: r.period_from, to: r.period_to }, line: r.computation, preparedBy: r.created_by_name, approvedBy: r.approved_by_name ?? undefined }));
 }

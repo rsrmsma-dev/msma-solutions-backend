@@ -2,15 +2,15 @@
 // from every payroll run until paid (ported from src/lib/pay/loans.ts). Accounting manages them;
 // employees may only see their own. The loan number and the note are encrypted (crypto.ts).
 //
-// Each run's loan installments and the approved reimbursements it pays out are worked out here too
-// (automaticItems), the same way the website does in src/lib/pay/runs.ts, so a run can only be saved
+// Each run's loan installments are worked out here too (reimbursements are released by Accounting, never
+// through payroll) in automaticItems, the same way the website does in src/lib/pay/runs.ts, so a run can only be saved
 // with the figures the database holds.
 
 import { LOAN_KINDS, type LoanKind } from "../../src/lib/pay/loanStore";
-import { claimType, type Category } from "../../src/lib/reimbursements/store";
 import { audit, can, scopeOf, seen, type Session } from "./auth";
 import { open, seal } from "./crypto";
 import { clean, pool, tx, UserError, type Db } from "./db";
+import { tellEmployees } from "./notify";
 
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null) ?? undefined);
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -93,6 +93,8 @@ export async function saveLoan(s: Session, id: string | undefined, body: any) {
     // The loan number stays out of the trail (it's encrypted in the table).
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "Payroll", action: id ? "Changed loan" : "Added loan", target: nameOf(e), employeeNo: e.employee_id,
       detail: `${input.kind}: ₱${input.principal.toLocaleString("en-PH")}, ₱${input.installment.toLocaleString("en-PH")} per cutoff from ${input.startDate}` });
+    await tellEmployees(c, s, input.employeeId, "loan", "update", id ? `Your ${input.kind} deduction changed` : `New ${input.kind} deduction`,
+      `₱${input.installment.toLocaleString("en-PH")} per cutoff from ${input.startDate}, ₱${input.principal.toLocaleString("en-PH")} in all (${input.reference}).`);
     return loanJson(row, (await paidByLoan(c)).get(row.id) ?? 0);
   });
 }
@@ -107,6 +109,7 @@ export async function stopLoan(s: Session, id: string, reason: string) {
     if (!reason.trim()) throw new UserError("Say why the deductions stop");
     await c.query(`update loans set status = 'stopped', closed_by = $2, closed_by_name = $3, closed_at = now(), note = $4 where id = $1`, [l.id, s.accountId, s.name, seal(reason.trim())]);
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "Payroll", action: "Stopped loan deductions", target: nameOf(l), employeeNo: l.employee_id, detail: l.kind });
+    await tellEmployees(c, s, l.employee_id, "loan", "update", `Your ${l.kind} deductions stopped`, `${open(l.reference)}: “${reason.trim()}”`);
   });
 }
 
@@ -148,10 +151,8 @@ export async function automaticItems(c: Db, run: { id?: string; to: string }, on
     const amount = Math.min(l.installment, balance);
     add(l.employee_id, { id: `loan-${l.id}`, label: l.kind, amount: -amount, taxable: false, reason: `${open(l.reference)} · balance ${money(balance - amount)} after this`, loanId: l.id });
   }
-  const claims = (await c.query(`select * from reimbursement_claims where status = 'approved' and paid_at is null order by filed_at desc`)).rows;
-  for (const r of claims) {
-    add(r.employee_id, { id: `claim-${r.id}`, label: `Reimbursement: ${claimType({ category: r.category as Category, otherType: r.other_type ?? undefined })}`, amount: r.amount, taxable: false, reason: r.merchant, claimId: r.id });
-  }
+  // Reimbursements aren't paid through payroll: Accounting releases them directly (reimbursements.ts),
+  // as on the website (src/lib/pay/runs.ts). Runs already approved keep the claims they paid.
   return out;
 }
 

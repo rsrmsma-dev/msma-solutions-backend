@@ -44,6 +44,10 @@ export interface Announcement {
   id: string;
   title: string;
   postedOn: string;
+  /** Longer text, when there is one. */
+  body?: string;
+  /** Who posted it. */
+  postedBy?: string;
 }
 
 export type LeaveType = "Vacation" | "Sick" | "Emergency" | "Bereavement";

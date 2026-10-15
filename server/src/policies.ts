@@ -9,6 +9,7 @@ import { nameOf, storeFile } from "./corehr";
 import { open } from "./crypto";
 import { clean, need020, pool, schema020, tx, UserError, type Db } from "./db";
 import { queue } from "./outbox";
+import { EVERYONE, tellRoles } from "./notify";
 
 /** Same list as POLICY_CATEGORIES in src/lib/policies.ts (and the column's CHECK). */
 const CATEGORIES = ["Employee handbook", "Code of conduct", "Attendance & time", "Leave", "Pay & benefits", "Data privacy", "Health & safety", "Other"];
@@ -124,6 +125,7 @@ export async function setPolicyStatus(s: Session, id: string, status: unknown) {
       const people = (await c.query(`select employee_id from employees where ${CURRENT}`)).rows;
       const body = `${p.title} is published${p.require_ack ? " and needs your confirmation that you've read it" : ""}. Read it on heyhr under Company policies.`;
       await queue(c, s, people.map((e) => ({ employeeId: e.employee_id, event: "policy", subject: `New company policy: ${p.title}`, body })));
+      await tellRoles(c, s, EVERYONE, "policy", "update", `New company policy: ${p.title}`, p.require_ack ? "Read it and confirm you've read it under Company policies." : "Read it under Company policies.");
     }
   });
 }

@@ -12,8 +12,12 @@ import { DEFAULT_SHIFTS, shiftProblem, tardinessRuleProblem } from "../../src/li
 import type { ShiftTemplate } from "../../src/lib/timekeeping/types";
 import { can, demand, seenIds, type Session } from "./auth";
 import { open, seal } from "./crypto";
-import { clean, pool, schema020, tx, UserError, type Db } from "./db";
+import { clean, need027, pool, schema020, schema027, schema030, tx, UserError, type Db } from "./db";
 import { schedulingRules } from "./settings";
+import { EVERYONE, dates as when, tellApprover, tellEmployees, tellRoles, who } from "./notify";
+
+/** "1h 30m" for a notification. */
+const span = (minutes: number) => [Math.floor(minutes / 60) && `${Math.floor(minutes / 60)}h`, minutes % 60 && `${minutes % 60}m`].filter(Boolean).join(" ") || "0m";
 
 const TZ = process.env.APP_TIME_ZONE ?? "Asia/Manila";
 const HHMM = /^\d{2}:\d{2}$/;
@@ -97,13 +101,14 @@ function punchJson(p: any, s?: Session) {
 function shiftJson(r: any): ShiftTemplate {
   return clean({
     id: r.id, name: r.name, start: hhmm(r.start_time)!, end: hhmm(r.end_time)!, breakMinutes: r.break_minutes, breakStart: hhmm(r.break_start)!,
-    graceMinutes: r.grace_minutes, restDays: r.rest_days, flexible: r.is_flexible || undefined, requiredHours: r.required_hours ?? undefined, active: r.is_active,
+    graceMinutes: r.grace_minutes, restDays: r.rest_days, flexible: r.is_flexible || undefined, requiredHours: r.required_hours ?? undefined, saturdayEnd: hhmm(r.saturday_end ?? null), active: r.is_active,
   });
 }
 
 const requestJson = (r: any) => clean({
   id: r.id, employeeId: r.employee_id, date: r.work_date, type: r.request_type, minutes: r.minutes, reason: r.reason, status: r.status,
   filedBy: r.filed_by_name, filedAt: iso(r.filed_at), decidedBy: r.decided_by_name, decidedAt: iso(r.decided_at), note: r.decision_note,
+  startAt: iso(r.start_at), endAt: iso(r.end_at),
 });
 const fixJson = (r: any) => clean({
   id: r.id, employeeId: r.employee_id, workDate: r.work_date, kind: r.direction, time: hhmm(r.requested_time), nextDay: r.next_day || undefined,
@@ -244,7 +249,11 @@ export async function saveShift(s: Session, body: any) {
     breakMinutes: Number(body?.breakMinutes ?? 0), breakStart: String(body?.breakStart ?? ""), graceMinutes: Number(body?.graceMinutes ?? 0),
     restDays: Array.isArray(body?.restDays) ? body.restDays.map(Number) : [], flexible: !!body?.flexible,
     requiredHours: body?.requiredHours === undefined || body?.requiredHours === null || body?.requiredHours === "" ? undefined : Number(body.requiredHours),
+    saturdayEnd: body?.saturdayEnd ? String(body.saturdayEnd) : undefined,
   };
+  // A Saturday end time needs migration 027; other shift changes work without it.
+  const has027 = await schema027();
+  if (input.saturdayEnd && !has027) await need027();
   return tx(async (c) => {
     const others = (await c.query(`select * from shift_templates`)).rows.map(shiftJson);
     const problem = shiftProblem(input, others);
@@ -258,6 +267,7 @@ export async function saveShift(s: Session, body: any) {
     } else {
       await c.query(`insert into shift_templates (id, name, start_time, end_time, break_minutes, break_start, grace_minutes, rest_days, is_flexible, required_hours) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, v);
     }
+    if (has027) await c.query(`update shift_templates set saturday_end = $2 where id = $1`, [id, input.saturdayEnd ?? null]);
     return shiftJson((await c.query(`select * from shift_templates where id = $1`, [id])).rows[0]);
   });
 }
@@ -279,6 +289,7 @@ export async function setUsualShift(s: Session, employeeIds: unknown, shiftId: u
       await c.query(`update employees set default_shift_id = $2, updated_at = now() where employee_id = $1`, [id, shiftId || null]);
       await log(c, s, id, day, "Changed usual shift", `Now on ${name}`);
     }
+    await tellEmployees(c, s, ids, "schedule", "update", "Your usual shift changed", shiftId ? `You're now on ${name}. Check your schedule before your next workday.` : `${s.name} removed your usual shift. Ask HR for your schedule.`);
   });
 }
 
@@ -307,6 +318,7 @@ export async function setDayShift(s: Session, employeeId: string, date: string, 
       );
     }
     await log(c, s, employeeId, date, "Changed schedule", label);
+    await tellEmployees(c, s, employeeId, "schedule", "update", `Your schedule for ${when(date)} changed`, `It's now ${label}.`);
   });
 }
 
@@ -315,6 +327,16 @@ export async function setDayShift(s: Session, employeeId: string, date: string, 
 export async function fileRequest(s: Session, body: any) {
   const input = { employeeId: String(body?.employeeId ?? ""), date: String(body?.date ?? ""), type: String(body?.type ?? ""), minutes: Number(body?.minutes), reason: String(body?.reason ?? "").trim() };
   demand(s, "create", "attendanceRecords", input.employeeId);
+  // Start and end (local date-times, e.g. "2026-10-09T17:30"): the day and the minutes follow from them.
+  const LOCAL = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/;
+  const times = body?.start !== undefined || body?.end !== undefined ? { start: String(body?.start ?? ""), end: String(body?.end ?? "") } : undefined;
+  if (times) {
+    if (!LOCAL.test(times.start) || !LOCAL.test(times.end)) throw new UserError("Choose the start and end date and time");
+    const mins = Math.round((Date.parse(`${times.end}:00Z`) - Date.parse(`${times.start}:00Z`)) / 60_000);
+    if (!(mins > 0)) throw new UserError("The end must be after the start");
+    input.minutes = mins;
+    input.date = times.start.slice(0, 10);
+  }
   if (input.type !== "overtime" && input.type !== "undertime") throw new UserError("Choose overtime or undertime");
   if (!DATE.test(input.date)) throw new UserError("Choose the day");
   if (!Number.isFinite(input.minutes) || input.minutes <= 0) throw new UserError("Enter how many minutes");
@@ -325,11 +347,16 @@ export async function fileRequest(s: Session, body: any) {
     await c.query(`select pg_advisory_xact_lock(hashtext('time:' || $1))`, [input.employeeId]);
     const dup = await c.query(`select 1 from time_requests where employee_id = $1 and work_date = $2 and request_type = $3 and status <> 'declined'`, [input.employeeId, input.date, input.type]);
     if (dup.rowCount) throw new UserError("There's already a request for that day");
-    const { rows: [r] } = await c.query(
+    let { rows: [r] } = await c.query(
       `insert into time_requests (employee_id, work_date, request_type, minutes, reason, filed_by_name) values ($1,$2,$3,$4,$5,$6) returning *`,
       [input.employeeId, input.date, input.type, Math.round(input.minutes), input.reason, s.name],
     );
-    await log(c, s, input.employeeId, input.date, `Filed ${input.type}`, `${Math.round(input.minutes)} min: ${input.reason}`);
+    // The times are kept once migration 030 is applied; before that the request keeps its minutes only.
+    if (times && (await schema030(c))) {
+      ({ rows: [r] } = await c.query(`update time_requests set start_at = ($2::timestamp at time zone $4), end_at = ($3::timestamp at time zone $4) where id = $1 returning *`, [r.id, times.start, times.end, TZ]));
+    }
+    await log(c, s, input.employeeId, input.date, `Filed ${input.type}`, `${Math.round(input.minutes)} min${times ? ` (${times.start.slice(11)} – ${times.end.slice(11)})` : ""}: ${input.reason}`);
+    await tellApprover(c, s, input.employeeId, input.type as "overtime" | "undertime", "request", `${await who(c, input.employeeId)} filed ${input.type}`, `${span(Math.round(input.minutes))} on ${when(input.date)}. “${input.reason}” Review it under Approvals.`);
     return requestJson(r);
   });
 }
@@ -346,6 +373,7 @@ export async function decideRequest(s: Session, id: string, approve: boolean, no
       [r.id, approve ? "approved" : "declined", s.accountId, s.name, note.trim() || null],
     );
     await log(c, s, r.employee_id, r.work_date, approve ? `Approved ${r.request_type}` : `Declined ${r.request_type}`, `${r.minutes} min${note.trim() ? `: ${note.trim()}` : ""}`);
+    await tellEmployees(c, s, r.employee_id, r.request_type, approve ? "approved" : "rejected", `Your ${r.request_type} was ${approve ? "approved" : "declined"}`, `${span(r.minutes)} on ${when(r.work_date)} · ${approve ? "approved" : "declined"} by ${s.name}.${note.trim() ? ` “${note.trim()}”` : ""}`);
     return requestJson(next);
   });
 }
@@ -402,6 +430,8 @@ export async function declareRemoteDay(s: Session, body: any) {
     for (const b of branches) await c.query(`insert into remote_work_day_branches (remote_work_day_id, branch_id) values ($1, $2)`, [d.id, b.id]);
     await c.query(`insert into audit_log (actor_account_id, actor_name, module, action, target, detail) values ($1, $2, 'Timekeeping', 'Declared remote work day', $3, $4)`,
       [s.accountId, s.name, offices.length ? offices.join(", ") : "All offices", `${from}${to !== from ? ` to ${to}` : ""}: ${reason}`]);
+    const names: string[] = branches.map((b) => b.name);
+    await tellRoles(c, s, EVERYONE, "attendance", "update", `Remote work day: ${when(from, to)}`, `${names.length ? `${names.join(", ")} offices` : "Everyone"} works from home. “${reason}” Clock in from home with a face scan.`);
     return { id: d.id, from, to, offices: branches.map((b) => b.name), reason, declaredBy: s.name, declaredAt: iso(d.declared_at) };
   });
 }
@@ -465,6 +495,7 @@ export async function setWorkFromHome(s: Session, on: boolean) {
     if (on) {
       await c.query(`insert into work_from_home_days (employee_id, work_date) values ($1, $2) on conflict do nothing`, [employeeId, date]);
       await log(c, s, employeeId, date, "Switched to work from home", "Clocks in with a face scan");
+      await tellApprover(c, s, employeeId, "attendance", "update", `${await who(c, employeeId)} is working from home today`, "They clock in with a face scan. You can see their times in Team Attendance.");
     } else {
       const { rowCount } = await c.query(`delete from work_from_home_days where employee_id = $1 and work_date = $2`, [employeeId, date]);
       if (!rowCount) return;
@@ -492,6 +523,7 @@ export async function sendNotice(s: Session, body: any) {
       [employeeId, kind, subject, message, dates, s.accountId, s.name],
     );
     await log(c, s, employeeId, dates[0] ?? (await today(c)), `Sent ${kind === "awol" ? "AWOL" : "tardiness"} notice`, subject);
+    await tellEmployees(c, s, employeeId, "attendance", "alert", `${kind === "awol" ? "AWOL" : "Tardiness"} notice: ${subject}`, `From ${s.name}. Read it and acknowledge it on your Attendance page.`);
     return noticeJson(n);
   });
 }
@@ -543,6 +575,7 @@ export async function fileFix(s: Session, body: any) {
       [input.employeeId, input.workDate, input.kind, input.time, input.nextDay, input.cause, recorded ?? null, input.reason, s.name],
     );
     await log(c, s, input.employeeId, input.workDate, `Asked to adjust time-${input.kind}`, `${recorded ? `${recorded} → ` : ""}${input.time}${input.nextDay ? " (next day)" : ""}: ${input.reason}`);
+    await tellApprover(c, s, input.employeeId, "adjustment", "request", `${await who(c, input.employeeId)} asked to adjust a time-${input.kind}`, `${when(input.workDate)}: ${recorded ? `${recorded} → ` : ""}${input.time}. “${input.reason}” Review it under Approvals.`);
     return fixJson(r);
   });
 }
@@ -567,17 +600,23 @@ export async function decideFix(s: Session, id: string, approve: boolean, note: 
       [r.id, approve ? "approved" : "declined", s.accountId, s.name, note.trim() || null],
     );
     if (!approve) await log(c, s, r.employee_id, r.work_date, `Declined time-${r.direction} adjustment`, note.trim());
+    await tellEmployees(c, s, r.employee_id, "adjustment", approve ? "approved" : "rejected", `Your time-${r.direction} adjustment was ${approve ? "approved" : "declined"}`, `${when(r.work_date)}, ${hhmm(r.requested_time)} · ${approve ? "approved" : "declined"} by ${s.name}.${note.trim() ? ` “${note.trim()}”` : ""}`);
     return fixJson(next);
   });
 }
 
 /** The built-in shifts, for the seed script. */
 export async function seedShifts(c: Db) {
+  const has027 = await schema027(c);
   for (const sh of DEFAULT_SHIFTS) {
+    const v = [sh.id, sh.name, sh.start, sh.end, sh.breakMinutes, sh.breakStart, sh.graceMinutes, sh.restDays, !!sh.flexible, sh.requiredHours ?? null, sh.active];
     await c.query(
-      `insert into shift_templates (id, name, start_time, end_time, break_minutes, break_start, grace_minutes, rest_days, is_flexible, required_hours, is_active)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict do nothing`,
-      [sh.id, sh.name, sh.start, sh.end, sh.breakMinutes, sh.breakStart, sh.graceMinutes, sh.restDays, !!sh.flexible, sh.requiredHours ?? null, sh.active],
+      has027
+        ? `insert into shift_templates (id, name, start_time, end_time, break_minutes, break_start, grace_minutes, rest_days, is_flexible, required_hours, is_active, saturday_end)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) on conflict do nothing`
+        : `insert into shift_templates (id, name, start_time, end_time, break_minutes, break_start, grace_minutes, rest_days, is_flexible, required_hours, is_active)
+           values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) on conflict do nothing`,
+      has027 ? [...v, sh.saturdayEnd ?? null] : v,
     );
   }
 }

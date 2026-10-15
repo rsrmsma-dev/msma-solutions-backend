@@ -42,7 +42,9 @@ CREATE TABLE company_settings (
   leave_accrual text NOT NULL DEFAULT 'yearly' CHECK (leave_accrual IN ('yearly', 'monthly', 'per-payroll')),
   overtime_threshold_minutes smallint NOT NULL DEFAULT 0,
   default_break_minutes smallint NOT NULL DEFAULT 60,
-  schedule_publish_lead_days smallint NOT NULL DEFAULT 7
+  schedule_publish_lead_days smallint NOT NULL DEFAULT 7,
+  payday_first smallint NOT NULL DEFAULT 10,
+  payday_second smallint NOT NULL DEFAULT 25
 );
 
 -- The organization tree: one company, its branches, their departments and teams (clusters).
@@ -54,7 +56,9 @@ CREATE TABLE org_units (
   parent_id uuid,
   head_employee_id varchar(20),
   address text,
-  is_active boolean NOT NULL DEFAULT true
+  is_active boolean NOT NULL DEFAULT true,
+  contact_name text,
+  contact_phone text
 );
 
 -- Budgeted job positions within a department.
@@ -306,7 +310,18 @@ CREATE TABLE certificate_requests (
   purpose text NOT NULL,
   status text NOT NULL DEFAULT 'Pending' CHECK (status IN ('Pending', 'Ready for pickup', 'Released')),
   requested_at timestamptz NOT NULL DEFAULT now(),
-  released_at timestamptz
+  released_at timestamptz,
+  delivery text CHECK (delivery IN ('digital', 'pickup')),
+  handled_by uuid,
+  handled_by_name text,
+  handled_at timestamptz,
+  decline_reason text,
+  certificate_no text UNIQUE,
+  issued_statement text,
+  issued_purpose text,
+  issued_at timestamptz,
+  issued_by uuid,
+  issued_by_name text
 );
 
 -- ======================================================================
@@ -325,7 +340,8 @@ CREATE TABLE shift_templates (
   rest_days smallint[] NOT NULL DEFAULT '{0,6}',
   is_flexible boolean NOT NULL DEFAULT false,
   required_hours numeric(4,2),
-  is_active boolean NOT NULL DEFAULT true
+  is_active boolean NOT NULL DEFAULT true,
+  saturday_end time
 );
 
 -- A different shift, or a rest day, for one person on one date.
@@ -386,7 +402,9 @@ CREATE TABLE time_requests (
   decided_by uuid,
   decided_by_name text,
   decided_at timestamptz,
-  decision_note text
+  decision_note text,
+  start_at timestamptz,
+  end_at timestamptz
 );
 
 -- Employee asks HR to add or correct a time-in/out the device missed.
@@ -556,7 +574,10 @@ CREATE TABLE payroll_runs (
   approved_by uuid,
   approved_by_name text,
   approved_at timestamptz,
-  payslips_released_at timestamptz
+  payslips_released_at timestamptz,
+  reviewed_by uuid,
+  reviewed_by_name text,
+  reviewed_at timestamptz
 );
 
 -- One employee's pay in a run: the payslip.
@@ -615,6 +636,24 @@ CREATE TABLE loans (
   closed_at timestamptz
 );
 
+-- Each employee's pay settings (Payroll > Pay details): work week, allowances and tax-free pay the payroll engine uses. No row = 5-day week and no allowances.
+CREATE TABLE employee_pay_profiles (
+  employee_id varchar(20) PRIMARY KEY,
+  work_week text NOT NULL DEFAULT '5-day' CHECK (work_week IN ('5-day', '6-day')),
+  transport_allowance numeric(12,2) NOT NULL DEFAULT 0,
+  ot_meal_rate numeric(10,2) NOT NULL DEFAULT 0,
+  de_minimis numeric(12,2) NOT NULL DEFAULT 0,
+  other_non_taxable numeric(12,2) NOT NULL DEFAULT 0,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  updated_by uuid,
+  updated_by_name text,
+  client_share numeric(5,2) NOT NULL DEFAULT 0,
+  client text NOT NULL DEFAULT '',
+  skip_sss boolean NOT NULL DEFAULT false,
+  skip_philhealth boolean NOT NULL DEFAULT false,
+  skip_pagibig boolean NOT NULL DEFAULT false
+);
+
 -- Final pay (back pay) for someone leaving. Opened when HR records a separation or by Accounting; releasing it freezes the figures, settles the loans and pays out approved reimbursements.
 CREATE TABLE final_pay_cases (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -657,12 +696,25 @@ CREATE TABLE reimbursement_claims (
   paid_by uuid,
   paid_by_name text,
   payout_method text CHECK (payout_method IN ('payroll', 'transfer', 'final pay')),
-  payout_reference text
+  payout_reference text,
+  release_method text CHECK (release_method IN ('cash', 'transfer', 'e-wallet', 'check'))
 );
 
 -- ======================================================================
 -- Access, workflows & audit
 -- ======================================================================
+
+-- The plans a client can be on (Administration > Clients & Subscriptions): employee seats, admin accounts and grace. Set up by our team.
+CREATE TABLE subscription_plans (
+  id text PRIMARY KEY,
+  name text NOT NULL UNIQUE,
+  employee_seat_limit integer NOT NULL,
+  admin_account_limit integer NOT NULL,
+  grace_percent smallint NOT NULL DEFAULT 0,
+  is_active boolean NOT NULL DEFAULT true,
+  sort_order smallint NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
 
 -- The company's HRIS plan (SaaS): plan, seat limit and billing period. One row per period; the newest one not cancelled or expired is current.
 CREATE TABLE subscriptions (
@@ -681,7 +733,25 @@ CREATE TABLE subscriptions (
   created_at timestamptz NOT NULL DEFAULT now(),
   created_by uuid,
   updated_at timestamptz NOT NULL DEFAULT now(),
-  updated_by uuid
+  updated_by uuid,
+  plan_id text,
+  seat_limit_override integer,
+  extension_seats integer,
+  extension_until date,
+  last_seat_level smallint NOT NULL DEFAULT 0 CHECK (last_seat_level IN (0, 80, 90, 100)),
+  last_seat_alert smallint CHECK (last_seat_alert IN (0, 80, 90, 100))
+);
+
+-- Log of seat alerts, refused adds, upgrade requests and plan changes (Administration > Clients & Subscriptions).
+CREATE TABLE subscription_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind text NOT NULL CHECK (kind IN ('threshold', 'blocked', 'upgrade-request', 'plan-changed', 'seat-override', 'extension')),
+  message text NOT NULL,
+  by_account uuid,
+  by_name text,
+  seats text NOT NULL,
+  admins text NOT NULL,
+  occurred_at timestamptz NOT NULL DEFAULT now()
 );
 
 -- The fixed roles: the website's six (access matrix in src/lib/permissions.ts) plus Admin, the owner company's own role with Super Admin's access. Who may create which is in server/src/hierarchy.ts.
@@ -786,6 +856,48 @@ CREATE TABLE audit_log (
   target text NOT NULL,
   detail text,
   data jsonb
+);
+
+-- Problems and questions the client's Super Admins, HR and Accounting send to our support team (Administration > Support). Our System Admins answer them and set status and priority.
+CREATE TABLE support_tickets (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  ticket_no integer NOT NULL UNIQUE,
+  subject text NOT NULL,
+  category text NOT NULL CHECK (category IN ('Bug or error', 'How do I…', 'Account or sign-in', 'Payroll', 'Data fix', 'Billing', 'Feature request')),
+  priority text NOT NULL DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high', 'urgent')),
+  status text NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'in_progress', 'waiting', 'resolved', 'closed')),
+  filed_by uuid,
+  filed_by_name text NOT NULL,
+  page text,
+  assignee text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- The conversation on a support ticket, oldest first.
+CREATE TABLE support_ticket_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  ticket_id uuid NOT NULL,
+  side text NOT NULL CHECK (side IN ('client', 'support')),
+  author_id uuid,
+  author_name text NOT NULL,
+  body text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Bell notifications: one row per person told about a request, a decision or a change (the bell in the top bar). Created by the server with the change that causes them.
+CREATE TABLE notifications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id uuid NOT NULL,
+  topic text NOT NULL,
+  kind text NOT NULL CHECK (kind IN ('request', 'approved', 'rejected', 'update', 'seat', 'alert')),
+  title text NOT NULL,
+  body text NOT NULL,
+  link text,
+  by_account uuid,
+  by_name text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  read_at timestamptz
 );
 
 -- ======================================================================
@@ -900,15 +1012,19 @@ COMMENT ON COLUMN company_settings.leave_accrual IS 'How leave credits are grant
 COMMENT ON COLUMN company_settings.overtime_threshold_minutes IS 'Extra time after a shift shorter than this isn''t overtime (Settings > Scheduling).';
 COMMENT ON COLUMN company_settings.default_break_minutes IS 'Lunch break pre-filled for new shifts.';
 COMMENT ON COLUMN company_settings.schedule_publish_lead_days IS 'How many days ahead schedules are published; stored for when there is a publishing step.';
+COMMENT ON COLUMN company_settings.payday_first IS 'First payday of the month: the first cut-off closes and is paid on this day (Payroll > Pay details > Paydays).';
+COMMENT ON COLUMN company_settings.payday_second IS 'Second payday of the month, at least a week after the first; 31 means the last day of the month.';
 COMMENT ON TABLE org_units IS 'The organization tree: one company, its branches, their departments and teams (clusters).';
 COMMENT ON COLUMN org_units.id IS 'Primary key.';
 COMMENT ON COLUMN org_units.unit_type IS 'Level in the tree.';
 COMMENT ON COLUMN org_units.name IS 'Display name, e.g. Cebu HQ, Tax Advisory, RPM.';
 COMMENT ON COLUMN org_units.code IS 'Short code used in tables and IDs, e.g. CEB, TAX.';
 COMMENT ON COLUMN org_units.parent_id IS 'Parent unit; null only for the company.';
-COMMENT ON COLUMN org_units.head_employee_id IS 'Head of the unit (department head, partner).';
+COMMENT ON COLUMN org_units.head_employee_id IS 'Head of the unit (department head, partner; a branch''s manager).';
 COMMENT ON COLUMN org_units.address IS 'Street address; branches only.';
 COMMENT ON COLUMN org_units.is_active IS 'Inactive units stay for history but can''t take new people.';
+COMMENT ON COLUMN org_units.contact_name IS 'Contact person at the office; branches only.';
+COMMENT ON COLUMN org_units.contact_phone IS 'Contact person''s phone (PH mobile or landline); branches only.';
 COMMENT ON TABLE positions IS 'Budgeted job positions within a department.';
 COMMENT ON COLUMN positions.id IS 'Primary key.';
 COMMENT ON COLUMN positions.title IS 'Job title, e.g. Experienced Associate.';
@@ -1102,6 +1218,17 @@ COMMENT ON COLUMN certificate_requests.purpose IS 'e.g. Bank loan application.';
 COMMENT ON COLUMN certificate_requests.status IS 'Status.';
 COMMENT ON COLUMN certificate_requests.requested_at IS 'Request time.';
 COMMENT ON COLUMN certificate_requests.released_at IS 'Release time.';
+COMMENT ON COLUMN certificate_requests.delivery IS 'How it reached the employee: a digital copy to download, or a signed copy picked up from HR.';
+COMMENT ON COLUMN certificate_requests.handled_by IS 'HR account that took the last step (issued, ready for pickup, released, declined).';
+COMMENT ON COLUMN certificate_requests.handled_by_name IS 'Name of who took the last step, kept if the account goes.';
+COMMENT ON COLUMN certificate_requests.handled_at IS 'When the last step was taken.';
+COMMENT ON COLUMN certificate_requests.decline_reason IS 'Why HR declined it, shown to the employee; encrypted by the app (AES-256-GCM). When set the request is declined (shown as Declined; status stays Pending).';
+COMMENT ON COLUMN certificate_requests.certificate_no IS 'Number of the issued certificate, e.g. COE-2026-0001 (per type and year).';
+COMMENT ON COLUMN certificate_requests.issued_statement IS 'The certificate''s exact wording when issued, made from the employee''s record at that time (HR''s filed copy and the employee''s download); encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN certificate_requests.issued_purpose IS 'Purpose printed on the issued certificate.';
+COMMENT ON COLUMN certificate_requests.issued_at IS 'When it was issued.';
+COMMENT ON COLUMN certificate_requests.issued_by IS 'HR account that issued it.';
+COMMENT ON COLUMN certificate_requests.issued_by_name IS 'Name of who issued it, kept if the account goes.';
 COMMENT ON TABLE shift_templates IS 'Work shifts: Busy season, Peak season, Mid shift, Flexible time.';
 COMMENT ON COLUMN shift_templates.id IS 'Short key, e.g. sh-day; new shifts get sh-…';
 COMMENT ON COLUMN shift_templates.name IS 'Shift name.';
@@ -1114,6 +1241,7 @@ COMMENT ON COLUMN shift_templates.rest_days IS 'Days off, 0 = Sunday.';
 COMMENT ON COLUMN shift_templates.is_flexible IS 'Clock in any time in the window; only hours worked count.';
 COMMENT ON COLUMN shift_templates.required_hours IS 'Hours a flexible day needs.';
 COMMENT ON COLUMN shift_templates.is_active IS 'Retired shifts stay for history.';
+COMMENT ON COLUMN shift_templates.saturday_end IS 'When Saturday ends on a six-day week (a shorter day, no break); empty = Saturday ends at end_time.';
 COMMENT ON TABLE schedule_overrides IS 'A different shift, or a rest day, for one person on one date.';
 COMMENT ON COLUMN schedule_overrides.employee_id IS 'The employee.';
 COMMENT ON COLUMN schedule_overrides.work_date IS 'The date.';
@@ -1162,6 +1290,8 @@ COMMENT ON COLUMN time_requests.decided_by IS 'Account that approved or declined
 COMMENT ON COLUMN time_requests.decided_by_name IS 'Name of who decided, kept if the account goes.';
 COMMENT ON COLUMN time_requests.decided_at IS 'When it was decided.';
 COMMENT ON COLUMN time_requests.decision_note IS 'Note from the approver to the employee.';
+COMMENT ON COLUMN time_requests.start_at IS 'When the overtime or undertime starts; minutes = end_at - start_at. Empty for requests filed before 030.';
+COMMENT ON COLUMN time_requests.end_at IS 'When it ends (can be the next day).';
 COMMENT ON TABLE punch_fix_requests IS 'Employee asks HR to add or correct a time-in/out the device missed.';
 COMMENT ON COLUMN punch_fix_requests.id IS 'Primary key.';
 COMMENT ON COLUMN punch_fix_requests.employee_id IS 'The employee this belongs to.';
@@ -1284,6 +1414,9 @@ COMMENT ON COLUMN payroll_runs.approved_by IS 'Who approved it (the CEO).';
 COMMENT ON COLUMN payroll_runs.approved_by_name IS 'Name of who approved it.';
 COMMENT ON COLUMN payroll_runs.approved_at IS 'When approved.';
 COMMENT ON COLUMN payroll_runs.payslips_released_at IS 'When employees could see their payslips.';
+COMMENT ON COLUMN payroll_runs.reviewed_by IS 'Account that reviewed the run (Summary sheet "Reviewed by").';
+COMMENT ON COLUMN payroll_runs.reviewed_by_name IS 'Name of who reviewed it, kept if the account goes.';
+COMMENT ON COLUMN payroll_runs.reviewed_at IS 'When it was reviewed.';
 COMMENT ON TABLE payroll_run_lines IS 'One employee''s pay in a run: the payslip.';
 COMMENT ON COLUMN payroll_run_lines.payroll_run_id IS 'The run.';
 COMMENT ON COLUMN payroll_run_lines.employee_id IS 'The employee.';
@@ -1330,6 +1463,21 @@ COMMENT ON COLUMN loans.created_at IS 'When added.';
 COMMENT ON COLUMN loans.closed_by IS 'Who stopped or settled it.';
 COMMENT ON COLUMN loans.closed_by_name IS 'Name of who closed it.';
 COMMENT ON COLUMN loans.closed_at IS 'When it was stopped or settled.';
+COMMENT ON TABLE employee_pay_profiles IS 'Each employee''s pay settings (Payroll > Pay details): work week, allowances and tax-free pay the payroll engine uses. No row = 5-day week and no allowances.';
+COMMENT ON COLUMN employee_pay_profiles.employee_id IS 'Whose pay settings.';
+COMMENT ON COLUMN employee_pay_profiles.work_week IS '5-day: Monday to Friday, 8 hours. 6-day: Monday to Friday 7 hours, Saturday 5.';
+COMMENT ON COLUMN employee_pay_profiles.transport_allowance IS 'Transport allowance for a full cut-off, PHP; prorated by days attended, not taxed.';
+COMMENT ON COLUMN employee_pay_profiles.ot_meal_rate IS 'Paid for each day with approved overtime, PHP.';
+COMMENT ON COLUMN employee_pay_profiles.de_minimis IS 'De minimis benefits inside the basic pay each cut-off, PHP; not taxed.';
+COMMENT ON COLUMN employee_pay_profiles.other_non_taxable IS 'Other non-taxable pay inside the basic pay each cut-off, PHP.';
+COMMENT ON COLUMN employee_pay_profiles.updated_at IS 'Last change.';
+COMMENT ON COLUMN employee_pay_profiles.updated_by IS 'Account that made the last change.';
+COMMENT ON COLUMN employee_pay_profiles.updated_by_name IS 'Name of who made the last change, kept if the account goes.';
+COMMENT ON COLUMN employee_pay_profiles.client_share IS 'Percent of the salary charged to Sphinx or a client (FT_MSMA % Sphinx), 0-100; booked to 14002 Advances - Sphinx.';
+COMMENT ON COLUMN employee_pay_profiles.client IS 'Who the share is charged to (FT_MSMA client column); empty when nothing is charged.';
+COMMENT ON COLUMN employee_pay_profiles.skip_sss IS 'True: no SSS taken from this person (sheet C typed 0).';
+COMMENT ON COLUMN employee_pay_profiles.skip_philhealth IS 'True: no PhilHealth taken from this person (sheet C typed 0).';
+COMMENT ON COLUMN employee_pay_profiles.skip_pagibig IS 'True: no Pag-IBIG taken from this person (sheet C typed 0).';
 COMMENT ON TABLE final_pay_cases IS 'Final pay (back pay) for someone leaving. Opened when HR records a separation or by Accounting; releasing it freezes the figures, settles the loans and pays out approved reimbursements.';
 COMMENT ON COLUMN final_pay_cases.id IS 'Primary key.';
 COMMENT ON COLUMN final_pay_cases.employee_id IS 'Who is leaving (one case each).';
@@ -1369,6 +1517,16 @@ COMMENT ON COLUMN reimbursement_claims.paid_by IS 'Account that recorded the pay
 COMMENT ON COLUMN reimbursement_claims.paid_by_name IS 'Name of who paid it, kept if the account goes.';
 COMMENT ON COLUMN reimbursement_claims.payout_method IS 'How it was paid: with a payroll run, by bank transfer, or in final pay.';
 COMMENT ON COLUMN reimbursement_claims.payout_reference IS 'The payroll run, the transfer reference, or Final pay; encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN reimbursement_claims.release_method IS 'How Accounting released it straight to the employee: cash, bank transfer, e-wallet or check (payout_method is then ''transfer''). Empty for claims paid with payroll or final pay, or released before this was recorded.';
+COMMENT ON TABLE subscription_plans IS 'The plans a client can be on (Administration > Clients & Subscriptions): employee seats, admin accounts and grace. Set up by our team.';
+COMMENT ON COLUMN subscription_plans.id IS 'Plan id, e.g. plan-starter.';
+COMMENT ON COLUMN subscription_plans.name IS 'Plan name, e.g. Starter.';
+COMMENT ON COLUMN subscription_plans.employee_seat_limit IS 'Employees the plan covers: records that aren''t Separated.';
+COMMENT ON COLUMN subscription_plans.admin_account_limit IS 'Active HR, Approver and Accounting logins the plan covers.';
+COMMENT ON COLUMN subscription_plans.grace_percent IS 'How far past either limit adds are still allowed, in percent, rounded down to whole seats.';
+COMMENT ON COLUMN subscription_plans.is_active IS 'Offered when choosing a plan.';
+COMMENT ON COLUMN subscription_plans.sort_order IS 'Order in the plan list.';
+COMMENT ON COLUMN subscription_plans.created_at IS 'When the row was created.';
 COMMENT ON TABLE subscriptions IS 'The company''s HRIS plan (SaaS): plan, seat limit and billing period. One row per period; the newest one not cancelled or expired is current.';
 COMMENT ON COLUMN subscriptions.id IS 'Primary key.';
 COMMENT ON COLUMN subscriptions.plan_name IS 'Plan the company is on, e.g. Starter, Business.';
@@ -1386,6 +1544,21 @@ COMMENT ON COLUMN subscriptions.created_at IS 'When the row was created.';
 COMMENT ON COLUMN subscriptions.created_by IS 'Account that set it up.';
 COMMENT ON COLUMN subscriptions.updated_at IS 'Last change.';
 COMMENT ON COLUMN subscriptions.updated_by IS 'Account that made the last change.';
+COMMENT ON COLUMN subscriptions.plan_id IS 'The plan in force (its seat, admin-account and grace limits); empty = no plan set, so nothing is limited.';
+COMMENT ON COLUMN subscriptions.seat_limit_override IS 'Employee seat limit our team set for this client in place of the plan''s; empty = the plan''s.';
+COMMENT ON COLUMN subscriptions.extension_seats IS 'Temporary extra employee seats, until extension_until.';
+COMMENT ON COLUMN subscriptions.extension_until IS 'Last day the temporary extra seats apply.';
+COMMENT ON COLUMN subscriptions.last_seat_level IS 'Highest seat threshold (percent of the limit) already logged and told to System Admins; falls back when usage drops, so each crossing is told once.';
+COMMENT ON COLUMN subscriptions.last_seat_alert IS 'Highest seat threshold Super Admins and HR were already told about; empty = none yet.';
+COMMENT ON TABLE subscription_events IS 'Log of seat alerts, refused adds, upgrade requests and plan changes (Administration > Clients & Subscriptions).';
+COMMENT ON COLUMN subscription_events.id IS 'Primary key.';
+COMMENT ON COLUMN subscription_events.kind IS 'What happened.';
+COMMENT ON COLUMN subscription_events.message IS 'What happened, in words (an upgrade request includes its note).';
+COMMENT ON COLUMN subscription_events.by_account IS 'Account that did it; empty for automatic alerts and refusals.';
+COMMENT ON COLUMN subscription_events.by_name IS 'Name of who did it, kept if the account goes.';
+COMMENT ON COLUMN subscription_events.seats IS 'Employee seats used / limit at that moment, e.g. 17 / 20.';
+COMMENT ON COLUMN subscription_events.admins IS 'Admin accounts used / limit at that moment, e.g. 6 / 8.';
+COMMENT ON COLUMN subscription_events.occurred_at IS 'When.';
 COMMENT ON TABLE roles IS 'The fixed roles: the website''s six (access matrix in src/lib/permissions.ts) plus Admin, the owner company''s own role with Super Admin''s access. Who may create which is in server/src/hierarchy.ts.';
 COMMENT ON COLUMN roles.id IS 'Role id, e.g. super-admin, hr.';
 COMMENT ON COLUMN roles.role_key IS 'Which role: the access matrix''s six, or admin (ours).';
@@ -1465,6 +1638,39 @@ COMMENT ON COLUMN audit_log.employee_id IS 'Whose record it touched, if any.';
 COMMENT ON COLUMN audit_log.target IS 'What it touched, e.g. Valid Government ID.';
 COMMENT ON COLUMN audit_log.detail IS 'Human-readable detail.';
 COMMENT ON COLUMN audit_log.data IS 'Before/after values for edits.';
+COMMENT ON TABLE support_tickets IS 'Problems and questions the client''s Super Admins, HR and Accounting send to our support team (Administration > Support). Our System Admins answer them and set status and priority.';
+COMMENT ON COLUMN support_tickets.id IS 'Primary key.';
+COMMENT ON COLUMN support_tickets.ticket_no IS 'Ticket number shown to people, from 1001 up.';
+COMMENT ON COLUMN support_tickets.subject IS 'Short title.';
+COMMENT ON COLUMN support_tickets.category IS 'What it''s about.';
+COMMENT ON COLUMN support_tickets.priority IS 'How urgent it is.';
+COMMENT ON COLUMN support_tickets.status IS 'Open, in progress, waiting for the client, resolved or closed.';
+COMMENT ON COLUMN support_tickets.filed_by IS 'Account that filed it.';
+COMMENT ON COLUMN support_tickets.filed_by_name IS 'Name of who filed it, kept if the account goes.';
+COMMENT ON COLUMN support_tickets.page IS 'The page they were on, to help reproduce it.';
+COMMENT ON COLUMN support_tickets.assignee IS 'Who on our support team is on it.';
+COMMENT ON COLUMN support_tickets.created_at IS 'When the row was created.';
+COMMENT ON COLUMN support_tickets.updated_at IS 'Last reply or change.';
+COMMENT ON TABLE support_ticket_messages IS 'The conversation on a support ticket, oldest first.';
+COMMENT ON COLUMN support_ticket_messages.id IS 'Primary key.';
+COMMENT ON COLUMN support_ticket_messages.ticket_id IS 'The ticket.';
+COMMENT ON COLUMN support_ticket_messages.side IS 'Who wrote it: the client''s people, or our support team.';
+COMMENT ON COLUMN support_ticket_messages.author_id IS 'Account that wrote it.';
+COMMENT ON COLUMN support_ticket_messages.author_name IS 'Name shown on the message (Support team for our replies).';
+COMMENT ON COLUMN support_ticket_messages.body IS 'The message, encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN support_ticket_messages.created_at IS 'When the row was created.';
+COMMENT ON TABLE notifications IS 'Bell notifications: one row per person told about a request, a decision or a change (the bell in the top bar). Created by the server with the change that causes them.';
+COMMENT ON COLUMN notifications.id IS 'Primary key.';
+COMMENT ON COLUMN notifications.account_id IS 'Who it''s for (the sign-in that sees it in their bell).';
+COMMENT ON COLUMN notifications.topic IS 'What it''s about, e.g. leave, claim, certificate, subscription (src/lib/noticeLinks.ts).';
+COMMENT ON COLUMN notifications.kind IS 'Which icon the bell shows.';
+COMMENT ON COLUMN notifications.title IS 'Headline, encrypted by the app (AES-256-GCM): it can name people and amounts.';
+COMMENT ON COLUMN notifications.body IS 'Detail, encrypted by the app (AES-256-GCM).';
+COMMENT ON COLUMN notifications.link IS 'The page it opens for this person''s role; empty = nowhere.';
+COMMENT ON COLUMN notifications.by_account IS 'Account whose action caused it; empty for automatic alerts.';
+COMMENT ON COLUMN notifications.by_name IS 'Name of who caused it, kept if the account goes.';
+COMMENT ON COLUMN notifications.created_at IS 'When the row was created.';
+COMMENT ON COLUMN notifications.read_at IS 'When the person read it; empty = unread.';
 COMMENT ON TABLE announcements IS 'Company news shown on employee dashboards.';
 COMMENT ON COLUMN announcements.id IS 'Primary key.';
 COMMENT ON COLUMN announcements.title IS 'Headline.';
@@ -1537,6 +1743,9 @@ ALTER TABLE approval_workflow_steps ADD CHECK (approver_kind <> 'role' OR role_i
 ALTER TABLE contribution_rate_versions ADD UNIQUE (agency, effective_from);
 ALTER TABLE subscriptions ADD CHECK (seat_limit IS NULL OR seat_limit > 0);
 ALTER TABLE subscriptions ADD CHECK (price_per_seat IS NULL OR price_per_seat >= 0);
+ALTER TABLE subscriptions ADD CHECK (seat_limit_override IS NULL OR seat_limit_override > 0);
+ALTER TABLE subscriptions ADD CHECK ((extension_seats IS NULL) = (extension_until IS NULL) AND (extension_seats IS NULL OR extension_seats > 0));
+ALTER TABLE subscription_plans ADD CHECK (employee_seat_limit > 0 AND admin_account_limit >= 0 AND grace_percent BETWEEN 0 AND 100);
 ALTER TABLE loans ADD CHECK (principal > 0 AND installment > 0 AND installment <= principal);
 ALTER TABLE final_pay_cases ADD CHECK (released_at IS NULL OR (release_items IS NOT NULL AND release_total IS NOT NULL));
 ALTER TABLE reimbursement_claims ADD CHECK ((paid_at IS NULL) = (payout_method IS NULL));
@@ -1547,6 +1756,10 @@ ALTER TABLE holiday_changes ADD CHECK ((change_kind = 'cancel' AND new_date IS N
 ALTER TABLE holiday_changes ADD UNIQUE (builtin_rule_id, year);
 ALTER TABLE holiday_changes ADD UNIQUE (holiday_rule_id, year);
 ALTER TABLE company_policies ADD CHECK (version >= 1);
+ALTER TABLE company_settings ADD CONSTRAINT company_settings_paydays CHECK (payday_first BETWEEN 1 AND 31 AND payday_second BETWEEN 1 AND 31 AND payday_second - payday_first >= 7);
+ALTER TABLE employee_pay_profiles ADD CONSTRAINT employee_pay_profiles_amounts CHECK (transport_allowance >= 0 AND ot_meal_rate >= 0 AND de_minimis >= 0 AND other_non_taxable >= 0);
+ALTER TABLE employee_pay_profiles ADD CONSTRAINT employee_pay_profiles_client_share CHECK (client_share >= 0 AND client_share <= 100);
+ALTER TABLE time_requests ADD CONSTRAINT time_requests_times CHECK ((start_at IS NULL AND end_at IS NULL) OR (start_at IS NOT NULL AND end_at > start_at));
 CREATE UNIQUE INDEX company_policies_title_ci ON company_policies (lower(title)) WHERE status <> 'archived';
 
 -- New Employees Template rules (BRD v1.1, 11.2.1)
@@ -1603,6 +1816,8 @@ ALTER TABLE employee_cases ADD CONSTRAINT employee_cases_filed_by_fkey FOREIGN K
 ALTER TABLE company_assets ADD CONSTRAINT company_assets_assigned_employee_id_fkey FOREIGN KEY (assigned_employee_id) REFERENCES employees (employee_id) ON DELETE SET NULL ON UPDATE CASCADE;
 ALTER TABLE offboarding_cases ADD CONSTRAINT offboarding_cases_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE certificate_requests ADD CONSTRAINT certificate_requests_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE certificate_requests ADD CONSTRAINT certificate_requests_handled_by_fkey FOREIGN KEY (handled_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE certificate_requests ADD CONSTRAINT certificate_requests_issued_by_fkey FOREIGN KEY (issued_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_shift_id_fkey FOREIGN KEY (shift_id) REFERENCES shift_templates (id) ON DELETE SET NULL;
 ALTER TABLE schedule_overrides ADD CONSTRAINT schedule_overrides_set_by_fkey FOREIGN KEY (set_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
@@ -1636,6 +1851,7 @@ ALTER TABLE contribution_rate_versions ADD CONSTRAINT contribution_rate_versions
 ALTER TABLE payroll_runs ADD CONSTRAINT payroll_runs_branch_id_fkey FOREIGN KEY (branch_id) REFERENCES org_units (id) ON DELETE SET NULL;
 ALTER TABLE payroll_runs ADD CONSTRAINT payroll_runs_created_by_fkey FOREIGN KEY (created_by) REFERENCES user_accounts (id) ON DELETE RESTRICT;
 ALTER TABLE payroll_runs ADD CONSTRAINT payroll_runs_approved_by_fkey FOREIGN KEY (approved_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE payroll_runs ADD CONSTRAINT payroll_runs_reviewed_by_fkey FOREIGN KEY (reviewed_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE payroll_run_lines ADD CONSTRAINT payroll_run_lines_payroll_run_id_fkey FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs (id) ON DELETE CASCADE;
 ALTER TABLE payroll_run_lines ADD CONSTRAINT payroll_run_lines_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE payroll_adjustments ADD CONSTRAINT payroll_adjustments_payroll_run_id_fkey FOREIGN KEY (payroll_run_id) REFERENCES payroll_runs (id) ON DELETE RESTRICT;
@@ -1645,6 +1861,8 @@ ALTER TABLE payroll_adjustments ADD CONSTRAINT payroll_adjustments_loan_id_fkey 
 ALTER TABLE loans ADD CONSTRAINT loans_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE loans ADD CONSTRAINT loans_created_by_fkey FOREIGN KEY (created_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE loans ADD CONSTRAINT loans_closed_by_fkey FOREIGN KEY (closed_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE employee_pay_profiles ADD CONSTRAINT employee_pay_profiles_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE employee_pay_profiles ADD CONSTRAINT employee_pay_profiles_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE final_pay_cases ADD CONSTRAINT final_pay_cases_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE RESTRICT ON UPDATE CASCADE;
 ALTER TABLE final_pay_cases ADD CONSTRAINT final_pay_cases_opened_by_fkey FOREIGN KEY (opened_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE final_pay_cases ADD CONSTRAINT final_pay_cases_released_by_fkey FOREIGN KEY (released_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
@@ -1655,6 +1873,8 @@ ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_approver_de
 ALTER TABLE reimbursement_claims ADD CONSTRAINT reimbursement_claims_paid_by_fkey FOREIGN KEY (paid_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_created_by_fkey FOREIGN KEY (created_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_updated_by_fkey FOREIGN KEY (updated_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE subscriptions ADD CONSTRAINT subscriptions_plan_id_fkey FOREIGN KEY (plan_id) REFERENCES subscription_plans (id) ON DELETE SET NULL;
+ALTER TABLE subscription_events ADD CONSTRAINT subscription_events_by_account_fkey FOREIGN KEY (by_account) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE user_accounts ADD CONSTRAINT user_accounts_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE SET NULL ON UPDATE CASCADE;
 ALTER TABLE user_accounts ADD CONSTRAINT user_accounts_role_id_fkey FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE RESTRICT;
 ALTER TABLE user_sessions ADD CONSTRAINT user_sessions_account_id_fkey FOREIGN KEY (account_id) REFERENCES user_accounts (id) ON DELETE CASCADE;
@@ -1664,6 +1884,11 @@ ALTER TABLE approval_workflow_steps ADD CONSTRAINT approval_workflow_steps_reque
 ALTER TABLE approval_workflow_steps ADD CONSTRAINT approval_workflow_steps_role_id_fkey FOREIGN KEY (role_id) REFERENCES roles (id) ON DELETE SET NULL;
 ALTER TABLE audit_log ADD CONSTRAINT audit_log_actor_account_id_fkey FOREIGN KEY (actor_account_id) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE audit_log ADD CONSTRAINT audit_log_employee_id_fkey FOREIGN KEY (employee_id) REFERENCES employees (employee_id) ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE support_tickets ADD CONSTRAINT support_tickets_filed_by_fkey FOREIGN KEY (filed_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE support_ticket_messages ADD CONSTRAINT support_ticket_messages_ticket_id_fkey FOREIGN KEY (ticket_id) REFERENCES support_tickets (id) ON DELETE RESTRICT;
+ALTER TABLE support_ticket_messages ADD CONSTRAINT support_ticket_messages_author_id_fkey FOREIGN KEY (author_id) REFERENCES user_accounts (id) ON DELETE SET NULL;
+ALTER TABLE notifications ADD CONSTRAINT notifications_account_id_fkey FOREIGN KEY (account_id) REFERENCES user_accounts (id) ON DELETE CASCADE;
+ALTER TABLE notifications ADD CONSTRAINT notifications_by_account_fkey FOREIGN KEY (by_account) REFERENCES user_accounts (id) ON DELETE SET NULL;
 ALTER TABLE announcements ADD CONSTRAINT announcements_branch_id_fkey FOREIGN KEY (branch_id) REFERENCES org_units (id) ON DELETE SET NULL;
 ALTER TABLE announcements ADD CONSTRAINT announcements_posted_by_fkey FOREIGN KEY (posted_by) REFERENCES user_accounts (id) ON DELETE RESTRICT;
 ALTER TABLE compliance_filings ADD CONSTRAINT compliance_filings_filed_by_fkey FOREIGN KEY (filed_by) REFERENCES user_accounts (id) ON DELETE SET NULL;
@@ -1686,6 +1911,8 @@ CREATE INDEX ON attendance_notices (sent_by);
 CREATE INDEX ON audit_log (actor_account_id);
 CREATE INDEX ON audit_log (employee_id);
 CREATE INDEX ON certificate_requests (employee_id);
+CREATE INDEX ON certificate_requests (handled_by);
+CREATE INDEX ON certificate_requests (issued_by);
 CREATE INDEX ON company_assets (assigned_employee_id);
 CREATE INDEX ON company_policies (file_id);
 CREATE INDEX ON company_policies (updated_by);
@@ -1700,6 +1927,7 @@ CREATE INDEX ON employee_cases (filed_by);
 CREATE INDEX ON employee_documents (employee_id);
 CREATE INDEX ON employee_documents (file_id);
 CREATE INDEX ON employee_documents (verified_by);
+CREATE INDEX ON employee_pay_profiles (updated_by);
 CREATE INDEX ON employees (default_shift_id);
 CREATE INDEX ON employees (org_unit_id);
 CREATE INDEX ON employees (photo_file_id);
@@ -1730,6 +1958,8 @@ CREATE INDEX ON loans (closed_by);
 CREATE INDEX ON loans (created_by);
 CREATE INDEX ON loans (employee_id);
 CREATE INDEX ON mfa_backup_codes (account_id);
+CREATE INDEX ON notifications (account_id);
+CREATE INDEX ON notifications (by_account);
 CREATE INDEX ON offboarding_cases (employee_id);
 CREATE INDEX ON org_units (head_employee_id);
 CREATE INDEX ON org_units (parent_id);
@@ -1743,6 +1973,7 @@ CREATE INDEX ON payroll_run_lines (employee_id);
 CREATE INDEX ON payroll_runs (approved_by);
 CREATE INDEX ON payroll_runs (branch_id);
 CREATE INDEX ON payroll_runs (created_by);
+CREATE INDEX ON payroll_runs (reviewed_by);
 CREATE INDEX ON performance_reviews (employee_id);
 CREATE INDEX ON performance_reviews (reviewer_id);
 CREATE INDEX ON policy_acknowledgements (employee_id);
@@ -1765,8 +1996,13 @@ CREATE INDEX ON remote_work_day_branches (branch_id);
 CREATE INDEX ON remote_work_days (declared_by);
 CREATE INDEX ON schedule_overrides (set_by);
 CREATE INDEX ON schedule_overrides (shift_id);
+CREATE INDEX ON subscription_events (by_account);
 CREATE INDEX ON subscriptions (created_by);
+CREATE INDEX ON subscriptions (plan_id);
 CREATE INDEX ON subscriptions (updated_by);
+CREATE INDEX ON support_ticket_messages (author_id);
+CREATE INDEX ON support_ticket_messages (ticket_id);
+CREATE INDEX ON support_tickets (filed_by);
 CREATE INDEX ON time_requests (decided_by);
 CREATE INDEX ON time_requests (employee_id);
 CREATE INDEX ON training_records (employee_id);
@@ -1777,6 +2013,7 @@ CREATE INDEX ON punches (employee_id, work_date);
 CREATE INDEX ON leave_requests (employee_id, date_from, date_to);
 CREATE INDEX ON audit_log (employee_id, occurred_at DESC);
 CREATE INDEX ON employee_documents (expires_on) WHERE expires_on IS NOT NULL;
+CREATE INDEX ON notifications (account_id, created_at DESC);
 
-INSERT INTO schema_migrations (version) VALUES ('001_leave'), ('002_timekeeping'), ('003_payroll'), ('004_files'), ('005_comments'), ('006_roles_settings'), ('007_subscriptions'), ('008_audit_append_only'), ('009_encrypt_government_numbers'), ('010_encrypt_document_numbers'), ('011_encrypt_files_and_reasons'), ('012_encrypt_file_names'), ('013_mfa'), ('014_registration_requests'), ('015_admin_role'), ('016_registration_creates_sign_in'), ('017_bank_and_wfh'), ('018_final_pay_loans_payouts'), ('019_holidays_org_settings'), ('020_policies_outbox_wfh_location'), ('021_employee_details_later'), ('022_last_name_later');
+INSERT INTO schema_migrations (version) VALUES ('001_leave'), ('002_timekeeping'), ('003_payroll'), ('004_files'), ('005_comments'), ('006_roles_settings'), ('007_subscriptions'), ('008_audit_append_only'), ('009_encrypt_government_numbers'), ('010_encrypt_document_numbers'), ('011_encrypt_files_and_reasons'), ('012_encrypt_file_names'), ('013_mfa'), ('014_registration_requests'), ('015_admin_role'), ('016_registration_creates_sign_in'), ('017_bank_and_wfh'), ('018_final_pay_loans_payouts'), ('019_holidays_org_settings'), ('020_policies_outbox_wfh_location'), ('021_employee_details_later'), ('022_last_name_later'), ('023_branch_contact'), ('024_claims_certificates_support'), ('025_subscription_seats'), ('026_notifications'), ('027_pay_settings'), ('028_workbook_rules'), ('029_payroll_review'), ('030_time_request_times');
 COMMIT;

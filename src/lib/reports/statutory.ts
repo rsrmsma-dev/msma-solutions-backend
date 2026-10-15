@@ -109,13 +109,21 @@ export function removeVersion(agency: Agency, id: string) {
 /** Non-taxable ceiling for 13th month and other benefits. */
 export const THIRTEENTH_MONTH_EXEMPT = 90_000;
 
-export const round2 = (n: number) => Math.round(n * 100) / 100;
+// Like Excel's ROUND (halves away from zero): toPrecision drops float noise, so 493.245 → 493.25, not 493.24.
+export const round2 = (n: number) => (Math.sign(n) * Math.round(Number((Math.abs(n) * 100).toPrecision(15)))) / 100;
 
-/** Monthly Salary Credit: the ₱500 bracket the pay falls in, within the floor and ceiling. */
+/** Rounds a halfway value to the even neighbour (12.5 → 12, 13.5 → 14), as the workbook's sheet C amounts are. */
+export const roundHalfEven = (n: number) => {
+  const x = Number(n.toPrecision(15));
+  const f = Math.floor(x);
+  return x - f === 0.5 ? (f % 2 === 0 ? f : f + 1) : Math.round(x);
+};
+
+/** Monthly Salary Credit: the pay to the nearest ₱500 step, halfway to the even step (as MSMA's workbook, sheet C), within the floor and ceiling. */
 export function sssMsc(monthly: number, on?: string) {
   const r = ratesOn("sss", on);
   if (monthly <= 0) return 0;
-  const msc = Math.round(monthly / r.mscStep) * r.mscStep;
+  const msc = roundHalfEven(monthly / r.mscStep) * r.mscStep;
   return Math.min(r.mscMax, Math.max(r.mscMin, msc));
 }
 

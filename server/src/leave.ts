@@ -11,6 +11,9 @@ import { getSettings } from "./admin";
 import { companyHolidays } from "./holidays";
 import { leavePolicy } from "./settings";
 import { open, seal } from "./crypto";
+import { dates, tellApprover, tellEmployees, who } from "./notify";
+
+const dayCount = (n: number) => `${n} ${n === 1 ? "day" : "days"}`;
 
 export { DEFAULT_TYPES };
 
@@ -56,11 +59,12 @@ async function loadData(db: Db): Promise<LeaveData> {
 
 /** Sex, civil status and hire date in the app's terms, for eligibility and accrual. */
 async function facts(db: Db, employeeId: string): Promise<LeavePersonFacts | undefined> {
-  const r = (await db.query(`select sex, civil_status, date_hired from employees where employee_id = $1`, [employeeId])).rows[0];
+  const r = (await db.query(`select sex, civil_status, date_hired, employment_status from employees where employee_id = $1`, [employeeId])).rows[0];
   if (!r) return undefined;
   const sex = r.sex === "M" ? "Male" : r.sex === "F" ? "Female" : "";
   const civil = r.civil_status ? r.civil_status[0] + r.civil_status.slice(1).toLowerCase() : "";
-  return { personal: { sex, civilStatus: civil }, job: { dateHired: r.date_hired ?? "" } };
+  const employmentType = { REGULAR: "Regular", PROBATIONARY: "Probationary", FIXED_TERM: "Fixed-term" }[r.employment_status as string];
+  return { personal: { sex, civilStatus: civil }, job: { dateHired: r.date_hired ?? "", employmentType } };
 }
 
 export async function loadState(s: Session): Promise<LeaveData> {
@@ -116,7 +120,15 @@ export async function fileLeave(s: Session, body: any) {
         s.accountId, s.name, input.approveNow ? s.accountId : null, input.approveNow ? s.name : null, input.approveNow ? new Date() : null],
     );
     await log(c, s, input.approveNow ? "Filed and approved leave" : "Filed leave", input.employeeId, `${input.start}${input.end !== input.start ? ` to ${input.end}` : ""} (${p.days} days)`);
-    return (await loadData(c)).requests.find((x) => x.id === r.id);
+    const data = await loadData(c);
+    const req = data.requests.find((x) => x.id === r.id)!;
+    const filedType = data.types.find((t) => t.id === req.typeId)?.name ?? "Leave";
+    if (req.status === "pending") {
+      await tellApprover(c, s, req.employeeId, "leave", "request", `${await who(c, req.employeeId)} filed ${filedType}`, `${dates(req.start, req.end)} · ${dayCount(req.days)}. “${req.reason}” Review it under Approvals.`, req.days);
+    } else {
+      await tellEmployees(c, s, req.employeeId, "leave", "approved", `${filedType} filed and approved for you`, `${s.name} filed ${filedType} for you, ${dates(req.start, req.end)} (${dayCount(req.days)}). It's already approved.`);
+    }
+    return req;
   });
 }
 
@@ -133,12 +145,17 @@ export async function decideRequest(s: Session, id: string, approve: boolean, no
       const data = await loadData(c);
       const type = data.types.find((t) => t.id === r.leave_type_id);
       // Pending already includes this request, so compare against what's left before it.
-      const cr = creditsOf(data, r.employee_id);
-      if (type && type.earning.kind !== "unlimited" && cr.used >= cr.total) throw new UserError(`All ${cr.total} leaves for this year are used up. Ask them to file it as Leave without pay.`);
+      const cr = creditsOf(data, r.employee_id, undefined, (await facts(c, r.employee_id))?.job.dateHired);
+      if (type && type.earning.kind !== "unlimited" && cr.used + Number(r.days) > cr.total) throw new UserError(`Only ${fmtCredits(Math.max(0, cr.total - cr.used))} of VL/SL left this leave year (June to May). Ask them to file the rest as Leave without pay.`);
     }
     await c.query(`update leave_requests set status = $2, decided_by = $3, decided_by_name = $4, decided_at = now(), decision_note = $5 where id = $1`, [r.id, approve ? "approved" : "rejected", s.accountId, s.name, note.trim() || null]);
     await log(c, s, approve ? "Approved leave" : "Rejected leave", r.employee_id, `${r.date_from}${r.date_to !== r.date_from ? ` to ${r.date_to}` : ""}${note.trim() ? `: ${note.trim()}` : ""}`);
-    return (await loadData(c)).requests.find((x) => x.id === r.id);
+    const data = await loadData(c);
+    const next = data.requests.find((x) => x.id === r.id)!;
+    const typeName = data.types.find((t) => t.id === next.typeId)?.name ?? "leave";
+    const verdict = approve ? "approved" : "declined";
+    await tellEmployees(c, s, next.employeeId, "leave", approve ? "approved" : "rejected", `Your ${typeName} was ${verdict}`, `${dates(next.start, next.end)} · ${verdict} by ${s.name}.${note.trim() ? ` “${note.trim()}”` : ""}`);
+    return next;
   });
 }
 
@@ -155,30 +172,37 @@ export async function cancelRequest(s: Session, id: string, note: string) {
     if (!note.trim()) throw new UserError("Say why it's being cancelled");
     await c.query(`update leave_requests set status = 'cancelled', decided_by = $2, decided_by_name = $3, decided_at = now(), decision_note = $4 where id = $1`, [r.id, s.accountId, s.name, note.trim()]);
     await log(c, s, "Cancelled leave", r.employee_id, `${r.date_from}${r.date_to !== r.date_from ? ` to ${r.date_to}` : ""}: ${note.trim()}`);
-    return (await loadData(c)).requests.find((x) => x.id === r.id);
+    const data = await loadData(c);
+    const next = data.requests.find((x) => x.id === r.id)!;
+    const cancelledType = data.types.find((t) => t.id === next.typeId)?.name ?? "Leave";
+    if (next.employeeId === s.employeeNo) await tellApprover(c, s, next.employeeId, "leave", "update", `${await who(c, next.employeeId)} withdrew ${cancelledType}`, `${dates(next.start, next.end)}. “${note.trim()}”`, next.days);
+    else await tellEmployees(c, s, next.employeeId, "leave", "rejected", `Your ${cancelledType} was cancelled`, `${dates(next.start, next.end)} · cancelled by ${s.name}. “${note.trim()}”`);
+    return next;
   });
 }
 
-// ---- Credits (6 a year, shared by every paid leave type) ----
+// ---- VL/SL days by length of service, June to May (sheet SIL), shared by every paid leave type ----
 
 export async function adjustCredits(s: Session, input: { employeeId?: string; leaves?: number; reason?: string }) {
   demand(s, "edit", "leaveBalances", String(input.employeeId ?? ""));
   const leaves = Number(input.leaves);
   const reason = String(input.reason ?? "").trim();
-  if (!Number.isInteger(leaves) || leaves === 0) throw new UserError("Enter the leaves to add (e.g. 1) or remove (e.g. -1)");
-  if (Math.abs(leaves) > LEAVE_CREDITS_PER_YEAR) throw new UserError(`Change at most ${LEAVE_CREDITS_PER_YEAR} leaves at a time`);
-  if (!reason) throw new UserError("Say why the leaves are changing");
+  if (!Number.isInteger(leaves * 2) || leaves === 0) throw new UserError("Enter the days to add (e.g. 1 or 0.5) or remove (e.g. -1)");
+  if (Math.abs(leaves) > LEAVE_CREDITS_PER_YEAR) throw new UserError(`Change at most ${LEAVE_CREDITS_PER_YEAR} days at a time`);
+  if (!reason) throw new UserError("Say why the days are changing");
   const employeeId = String(input.employeeId ?? "");
   return tx(async (c) => {
-    if (!(await facts(c, employeeId))) throw new UserError("That employee no longer exists");
+    const person = await facts(c, employeeId);
+    if (!person) throw new UserError("That employee no longer exists");
     await lockEmployee(c, employeeId);
-    const cr = creditsOf(await loadData(c), employeeId);
+    const cr = creditsOf(await loadData(c), employeeId, undefined, person.job.dateHired);
     if (cr.available + leaves < 0) throw new UserError(`They only have ${fmtCredits(cr.available)} left`);
     const { rows: [a] } = await c.query(
       `insert into leave_adjustments (employee_id, leave_type_id, days, reason, adjusted_by, adjusted_by_name) values ($1, null, $2, $3, $4, $5) returning *`,
       [employeeId, leaves, reason, s.accountId, s.name],
     );
-    await log(c, s, "Changed leave balance", employeeId, `${leaves > 0 ? "+" : ""}${leaves} leaves: ${reason}`);
+    await log(c, s, "Changed leave balance", employeeId, `${leaves > 0 ? "+" : ""}${leaves} days: ${reason}`);
+    await tellEmployees(c, s, employeeId, "leave", "update", leaves > 0 ? `${fmtCredits(leaves)} added to your balance` : `${fmtCredits(-leaves)} taken from your balance`, `${s.name}: “${reason}” You now have ${fmtCredits(cr.available + leaves)} left this leave year.`);
     return { id: a.id, employeeId, typeId: CREDITS_ADJUSTMENT, days: a.days, reason, by: s.name, at: iso(a.adjusted_at)! };
   });
 }

@@ -6,8 +6,11 @@ import type { ShiftTemplate, TardinessRule } from "./types";
 
 export const DEFAULT_SHIFTS: ShiftTemplate[] = [
   { id: "sh-day", name: "Busy season", start: "08:30", end: "17:00", breakMinutes: 60, breakStart: "12:00", graceMinutes: 5, restDays: [0, 6], active: true },
-  { id: "sh-peak", name: "Peak season", start: "08:30", end: "17:30", breakMinutes: 60, breakStart: "12:00", graceMinutes: 5, restDays: [0, 6], active: true },
+  // Peak season: Monday to Saturday, 8:30 AM – 5:00 PM, lunch 12:00–1:00 (the workbook's DTR_FT office hours).
+  { id: "sh-peak", name: "Peak season", start: "08:30", end: "17:00", breakMinutes: 60, breakStart: "12:00", graceMinutes: 5, restDays: [0], active: true },
   { id: "sh-mid", name: "Mid shift", start: "09:00", end: "18:00", breakMinutes: 60, breakStart: "13:00", graceMinutes: 5, restDays: [0, 6], active: true },
+  // Six-day week (payroll workbook): 7 hours Monday to Friday, 5 hours on Saturday.
+  { id: "sh-6day", name: "Six-day week", start: "08:30", end: "16:30", breakMinutes: 60, breakStart: "12:00", graceMinutes: 5, restDays: [0], saturdayEnd: "13:30", active: true },
   { id: "sh-flex", name: "Flexible time", start: "08:30", end: "19:00", breakMinutes: 60, breakStart: "12:00", graceMinutes: 0, restDays: [0, 6], active: true, flexible: true, requiredHours: 8 },
 ];
 
@@ -35,6 +38,8 @@ export function shiftProblem(input: Omit<ShiftTemplate, "id" | "active"> & { id?
   if (!(input.graceMinutes >= 0 && input.graceMinutes <= 30)) return "Grace period should be between 0 and 30 minutes";
   if (!input.restDays.length) return "Pick at least one rest day. Everyone is entitled to a rest day each week.";
   if (input.restDays.some((d) => !Number.isInteger(d) || d < 0 || d > 6)) return "Rest days are Sunday (0) to Saturday (6)";
+  if (input.saturdayEnd && (!HHMM.test(input.saturdayEnd) || input.saturdayEnd <= input.start)) return "Saturday has to end after the shift starts";
+  if (input.saturdayEnd && input.restDays.includes(6)) return "Saturday is a rest day on this shift. Clear the Saturday end time or make Saturday a workday.";
   if (others.some((s) => s.id !== input.id && s.name.toLowerCase() === name.toLowerCase())) return "There's already a shift with that name";
   return null;
 }

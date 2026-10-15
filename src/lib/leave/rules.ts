@@ -38,7 +38,8 @@ export const policyOf = (data: Pick<LeaveData, "policy">): LeavePolicy => ({ ...
 /** What the rules need to know about the person: sex and civil status for eligibility, hire date for accrual and service length. */
 export interface LeavePersonFacts {
   personal: { sex: string; civilStatus: string };
-  job: { dateHired: string };
+  /** employmentType: "Regular", "Probationary" or "Fixed-term". */
+  job: { dateHired: string; employmentType?: string };
 }
 
 export const DEFAULT_TYPES: LeaveType[] = [
@@ -98,6 +99,8 @@ function monthsEarned(hireDate: string, today: string) {
 
 function eligibility(e: LeavePersonFacts | undefined, type: LeaveType): { eligible: boolean; note?: string } {
   if (!e) return { eligible: false, note: "Employee not found" };
+  // Leave without pay is for probationary staff; regular employees take paid leave from their VL/SL credits.
+  if (type.earning.kind === "unlimited" && e.job.employmentType === "Regular") return { eligible: false, note: "Regular employees use their VL/SL credits instead" };
   const sex = e.personal.sex;
   // No hire date on file yet (a record made by Add user): no service counted until it's filled in.
   const months = e.job.dateHired ? (Date.now() - new Date(`${e.job.dateHired}T00:00:00`).getTime()) / (30.44 * 86_400_000) : 0;
@@ -146,8 +149,23 @@ export function balanceOf(data: LeaveData, employeeId: string, person: LeavePers
   };
 }
 
-/** Every employee can file this many leaves a year, any paid type. Each leave uses 1, however many days it covers. */
-export const LEAVE_CREDITS_PER_YEAR = 6;
+/** The most VL/SL days a year (sheet SIL: over 3 years of service). */
+export const LEAVE_CREDITS_PER_YEAR = 18;
+
+/** VL/SL days by length of service, as sheet SIL: years = days since hire ÷ 365; over 3 years 18,
+ * over 1 year 6 per year of service (rounded), over 6 months 3, otherwise 0. */
+export function silCredits(hireDate: string | undefined, asOf: string) {
+  if (!hireDate) return 0;
+  const years = Math.max((Date.parse(`${asOf}T00:00:00Z`) - Date.parse(`${hireDate}T00:00:00Z`)) / 86_400_000 / 365, 0);
+  return years > 3 ? 18 : years > 1 ? Math.round(years * 6) : years > 0.5 ? 3 : 0;
+}
+
+/** The leave year runs June to May (sheet SIL, "FY 26-27"). */
+export function leaveYearOf(today: string) {
+  const y = Number(today.slice(0, 4));
+  const start = Number(today.slice(5, 7)) >= 6 ? y : y - 1;
+  return { from: `${start}-06-01`, to: `${start + 1}-05-31`, label: `June ${start} – May ${start + 1}` };
+}
 
 /** Adjustments with this type id change the yearly pool, not a leave type. */
 export const CREDITS_ADJUSTMENT = "credits";
@@ -163,15 +181,17 @@ export interface Credits {
   available: number;
 }
 
-/** The yearly credit pool. Leave without pay doesn't use credits. */
-export function creditsOf(data: LeaveData, employeeId: string, today = isoToday()): Credits {
-  const year = today.slice(0, 4);
+/** The VL/SL days for the leave year (sheet SIL): earned by length of service, plus HR's changes
+ * (e.g. last year's over/under commutation), less the days of paid leave used. Leave without pay uses none. */
+export function creditsOf(data: LeaveData, employeeId: string, today = isoToday(), hireDate?: string): Credits {
+  const fy = leaveYearOf(today);
+  const inYear = (d: string) => d.slice(0, 10) >= fy.from && d.slice(0, 10) <= fy.to;
   const paid = new Set(data.types.filter((t) => t.earning.kind !== "unlimited").map((t) => t.id));
-  const mine = data.requests.filter((r) => r.employeeId === employeeId && paid.has(r.typeId) && r.start.slice(0, 4) === year);
-  const used = mine.filter((r) => r.status === "approved").length;
-  const pending = mine.filter((r) => r.status === "pending").length;
-  const adjusted = data.adjustments.filter((a) => a.employeeId === employeeId && a.typeId === CREDITS_ADJUSTMENT && a.at.slice(0, 4) === year).reduce((n, a) => n + a.days, 0);
-  const total = Math.max(0, LEAVE_CREDITS_PER_YEAR + adjusted);
+  const mine = data.requests.filter((r) => r.employeeId === employeeId && paid.has(r.typeId) && inYear(r.start));
+  const used = mine.filter((r) => r.status === "approved").reduce((n, r) => n + r.days, 0);
+  const pending = mine.filter((r) => r.status === "pending").reduce((n, r) => n + r.days, 0);
+  const adjusted = data.adjustments.filter((a) => a.employeeId === employeeId && a.typeId === CREDITS_ADJUSTMENT && inYear(a.at)).reduce((n, a) => n + a.days, 0);
+  const total = Math.max(0, silCredits(hireDate, today) + adjusted);
   return { total, adjusted, used, pending, available: Math.max(0, total - used - pending) };
 }
 
@@ -218,8 +238,8 @@ export function previewOf(data: LeaveData, person: LeavePersonFacts | undefined,
   const balance = balanceOf(data, input.employeeId, person, type);
   if (!balance.eligible) errors.push(balance.eligibilityNote ?? "This employee can't use this leave type");
   else if (balance.eligibilityNote) notes.push(balance.eligibilityNote);
-  const credits = balance.unlimited ? undefined : creditsOf(data, input.employeeId);
-  if (credits && credits.available < 1 && !policy.allowNegative) errors.push(`All ${credits.total} leaves for this year are used up. File it as Leave without pay.`);
+  const credits = balance.unlimited ? undefined : creditsOf(data, input.employeeId, undefined, person?.job.dateHired);
+  if (credits && credits.available < days && !policy.allowNegative) errors.push(`Only ${fmtCredits(credits.available)} of VL/SL left this leave year (June to May). File the rest as Leave without pay.`);
   if (type.attachmentOver !== null && days > type.attachmentOver && !input.attachment) errors.push(type.attachmentOver === 0 ? `${type.name} needs a supporting document` : `${type.name} over ${type.attachmentOver} days needs a supporting document (e.g. medical certificate)`);
   const overlap = data.requests.find((r) => r.id !== ignoreId && r.employeeId === input.employeeId && (r.status === "pending" || r.status === "approved") && r.start <= input.end && r.end >= input.start);
   if (overlap) errors.push(`Overlaps another ${overlap.status} request (${overlap.start === overlap.end ? overlap.start : `${overlap.start} to ${overlap.end}`})`);
@@ -227,4 +247,4 @@ export function previewOf(data: LeaveData, person: LeavePersonFacts | undefined,
   return { days, balance, credits, errors, notes };
 }
 
-export const fmtCredits = (n: number) => `${n} ${n === 1 ? "leave" : "leaves"}`;
+export const fmtCredits = (n: number) => `${n} ${n === 1 ? "day" : "days"}`;

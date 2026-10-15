@@ -14,6 +14,8 @@ import { createHash } from "node:crypto";
 import { fingerprint, open, seal, sealBytes } from "./crypto.js";
 import { clean, pool, tx, UserError, type Db } from "./db.js";
 import { dropCase, ensureCase } from "./finalpay.js";
+import { assertSeatsAvailable, checkSeatThresholds } from "./subscription.js";
+import { dates, tellApprover, tellAssigned, tellEmployees } from "./notify.js";
 
 const DOCUMENT_TYPES = [
   "Application Form / Resume",
@@ -96,7 +98,8 @@ export async function loadState(s: Session) {
   // Payroll works out pay from salary, so whoever runs payroll sees salaries.
   const pay = can(s, "view", "payrollRuns") && scopeOf(s, "view", "payrollRuns") === "all";
   const [units, positions, employees, documents, events, auditRows] = await Promise.all([
-    pool.query(`select id, unit_type as type, name, code, parent_id as "parentId", head_employee_id as "headEmployeeId", address, is_active as active from org_units order by unit_type, name`),
+    pool.query(`select id, unit_type as type, name, code, parent_id as "parentId", head_employee_id as "headEmployeeId", address, is_active as active,
+                       to_jsonb(u) ->> 'contact_name' as "contactName", to_jsonb(u) ->> 'contact_phone' as "contactPhone" from org_units u order by unit_type, name`),
     pool.query(`select id, title, code, department_id as "departmentId", job_level as level, default_employment_type as "employmentType", budgeted_slots as slots,
                        reports_to_position_id as "reportsToPositionId", description, is_active as active from positions order by title`),
     pool.query(`select * from employees order by last_name, first_name`),
@@ -170,7 +173,7 @@ async function nextEmployeeId(c: pg.PoolClient) {
   return `MSMA-${String(rows[0].n).padStart(5, "0")}`;
 }
 
-async function insertDocuments(c: pg.PoolClient, employeeId: string, married: boolean, govId?: { idType?: string; idNumber?: string; idExpiry?: string; fileName?: string }) {
+export async function insertDocuments(c: pg.PoolClient, employeeId: string, married: boolean, govId?: { idType?: string; idNumber?: string; idExpiry?: string; fileName?: string }) {
   for (const type of DOCUMENT_TYPES) {
     const na = SITUATIONAL.includes(type) && !(married && type === "Marriage Certificate (PSA)");
     const gov = type === "Valid Government ID" && govId;
@@ -189,6 +192,13 @@ export async function createEmployee(s: Session, values: unknown) {
   if (!parsed.success) throw new UserError(firstIssue(parsed));
   const v = parsed.data;
   return tx(async (c) => {
+    const taken = await c.query(
+      `select 1 from employees where lower(email) in (lower($1), lower($2)) or lower(personal_email) in (lower($1), lower($2)) or mobile_no = $3 limit 1`,
+      [v.contact.workEmail, v.contact.personalEmail, toMobileNo(v.contact.mobile)],
+    );
+    if (taken.rowCount) throw new UserError("Another employee already uses one of these emails or this mobile number");
+    // A free seat on the plan (409 SEAT_LIMIT_REACHED otherwise); holds the seat lock until this hire commits.
+    await assertSeatsAvailable(c, 1);
     const { rows: [position] } = await c.query(`select * from positions where id::text = $1`, [v.job.positionId]);
     if (!position?.is_active) throw new UserError("That position isn't available");
     const { rows: [{ n: filled }] } = await c.query(`select count(*)::int as n from employees where position_id = $1 and record_status <> 'SEPARATED'`, [position.id]);
@@ -230,6 +240,7 @@ export async function createEmployee(s: Session, values: unknown) {
       s.accountId, s.name,
     ]);
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Created", target: "201 file", employeeNo: id, detail: "Created the employee record" });
+    await checkSeatThresholds(c);
     return employeeJson(await employeeRow(c, id));
   });
 }
@@ -454,6 +465,8 @@ export async function setReportsTo(s: Session, id: string, supervisorId: string 
     const before = e.supervisor_id ? await employeeRow(c, e.supervisor_id) : null;
     await c.query(`update employees set supervisor_id = $2, updated_at = now() where employee_id = $1`, [id, sup?.employee_id ?? null]);
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: "Organization chart", employeeNo: id, detail: `Reports to: ${before ? nameOf(before) : "—"} → ${sup ? nameOf(sup) : "—"}` });
+    await tellEmployees(c, s, id, "orgchart", "update", sup ? `You now report to ${nameOf(sup)}` : "Your manager changed", sup ? "They approve your leave, overtime and claims from now on." : "You no longer have a manager on the org chart.");
+    if (sup) await tellEmployees(c, s, sup.employee_id, "orgchart", "update", `${nameOf(e)} now reports to you`, "You'll get their leave, overtime and claim requests to approve.");
   });
 }
 
@@ -543,6 +556,15 @@ export async function updateDocument(s: Session, id: string, action: any) {
       default:
         throw new UserError("Unknown document action");
     }
+    // Who's told (as the website): HR when someone uploads their own; the person when HR adds, checks or returns one.
+    const type = d.document_type;
+    if (action.kind === "upload" && own) {
+      const owner = (await c.query(`select first_name, middle_name, last_name, suffix from employees where employee_id = $1`, [d.employee_id])).rows[0];
+      await tellAssigned(c, s, "edit", "documents", "documents", "request", `${owner ? nameOf(owner) : d.employee_id} uploaded their ${type}`, "Check it against the original on the 201 documents page.");
+    } else if (action.kind === "upload") await tellEmployees(c, s, d.employee_id, "documents", "update", `HR added your ${type}`, `${s.name} uploaded it to your 201 file.`);
+    else if (action.kind === "verify") await tellEmployees(c, s, d.employee_id, "documents", "approved", `Your ${type} was checked`, `${s.name} verified it against the original. Nothing else to do.`);
+    else if (action.kind === "return") await tellEmployees(c, s, d.employee_id, "documents", "rejected", `Your ${type} was sent back`, `“${String(action.note).trim()}” Upload a new one from your 201 file.`);
+    else if (action.kind === "reset") await tellEmployees(c, s, d.employee_id, "documents", "rejected", `Your ${type} was sent back`, "HR asked for it again. Upload a new one from your 201 file.");
   });
 }
 
@@ -571,6 +593,7 @@ export async function separationsDue(db: Db = pool) {
     );
     await closeAccounts(c, rows.map((r) => r.employee_id as string), { name: "HeyHR" });
     for (const r of rows) await audit(c, { actorName: "HeyHR", module: "People", action: "Edited", target: "Employment", employeeNo: r.employee_id, detail: "Status: Separated (last day passed)" });
+    if (rows.length) await checkSeatThresholds(c);
   });
 }
 
@@ -598,6 +621,36 @@ export async function recordSeparation(s: Session, id: string, body: any) {
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: "Employment", employeeNo: id, detail: `Separation recorded: ${reason}, last day ${lastDay}` });
     if (done) await closeAccounts(c, [id], { id: s.accountId, name: s.name });
     await ensureCase(c, s, id, lastDay, reason);
+    if (done) await checkSeatThresholds(c);
+    const name = nameOf(e);
+    await tellApprover(c, s, id, "separation", "update", `${name} is leaving`, `${reason}. Last day ${dates(lastDay)}.`);
+    await tellAssigned(c, s, "final", "payrollRuns", "separation", "request", `Final pay to prepare for ${name}`, `${reason}, last day ${dates(lastDay)}. A final pay case was opened.`);
+    return employeeJson(await employeeRow(c, id));
+  });
+}
+
+/**
+ * HR regularizes someone on probation or a fixed term: Regular from that date, a "Regularization"
+ * entry in their job history (note encrypted), and the employee is told.
+ */
+export async function regularize(s: Session, id: string, body: any) {
+  demand(s, "edit", "people", id);
+  const date = String(body?.date ?? ""), note = String(body?.note ?? "").trim();
+  return tx(async (c) => {
+    const e = (await c.query(`select * from employees where employee_id = $1 for update`, [id])).rows[0];
+    if (!e) throw new UserError("That employee no longer exists", 404);
+    if (e.record_status === "SEPARATED") throw new UserError("This employee is separated");
+    if (e.employment_status === "REGULAR") throw new UserError("This employee is already regular");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new UserError("Enter the date they became regular");
+    if (e.date_hired && date < e.date_hired) throw new UserError("That's before they were hired");
+    const from = FROM.employment[e.employment_status] ?? e.employment_status;
+    await c.query(`update employees set employment_status = 'REGULAR', regularization_date = $2, updated_at = now() where employee_id = $1`, [id, date]);
+    await c.query(
+      `insert into job_events (employee_id, event_kind, effective_date, changes, remarks, recorded_by, recorded_by_name) values ($1, 'Regularization', $2, $3, $4, $5, $6)`,
+      [id, date, JSON.stringify([{ label: "Employment type", from, to: "Regular" }]), note ? seal(note) : null, s.accountId, s.name],
+    );
+    await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: "Employment", employeeNo: id, detail: `Regularized: ${from} → Regular from ${date}` });
+    await tellEmployees(c, s, id, "documents", "approved", "You're now a regular employee", `From ${dates(date)}. Your VL/SL leave credits apply from here on.`);
     return employeeJson(await employeeRow(c, id));
   });
 }
@@ -606,12 +659,15 @@ export async function recordSeparation(s: Session, id: string, body: any) {
 export async function cancelSeparation(s: Session, id: string) {
   demand(s, "edit", "people", id);
   return tx(async (c) => {
+    // Bringing back someone already separated takes a seat again (seat lock first, then the row).
+    if ((await c.query(`select record_status from employees where employee_id = $1`, [id])).rows[0]?.record_status === "SEPARATED") await assertSeatsAvailable(c, 1);
     const e = (await c.query(`select * from employees where employee_id = $1 for update`, [id])).rows[0];
     if (!e?.separation_date) throw new UserError("There's no separation to cancel");
     await c.query(`update employees set separation_date = null, record_status = case when record_status = 'SEPARATED' then 'ACTIVE' else record_status end, updated_at = now() where employee_id = $1`, [id]);
     await c.query(`delete from job_events where employee_id = $1 and event_kind = 'Separation' and effective_date = $2`, [id, e.separation_date]);
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "People", action: "Edited", target: "Employment", employeeNo: id, detail: `Separation cancelled (last day was ${e.separation_date})` });
     await dropCase(c, id);
+    if (e.record_status === "SEPARATED") await checkSeatThresholds(c);
     return employeeJson(await employeeRow(c, id));
   });
 }

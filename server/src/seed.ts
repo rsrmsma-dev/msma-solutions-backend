@@ -66,6 +66,10 @@ await tx(async (c) => {
   await seedShifts(c);
   await seedRates(c);
   await seedWorkflows(c);
+  // The plans the website offers (migration 025); nobody is put on one here, so nothing is limited until a System Admin chooses.
+  if ((await c.query(`select to_regclass('subscription_plans') is not null as ok`)).rows[0].ok)
+    for (const [id, name, seats, admins, order] of [["plan-starter", "Starter", 20, 8, 1], ["plan-growth", "Growth", 50, 15, 2], ["plan-business", "Business", 150, 30, 3]] as const)
+      await c.query(`insert into subscription_plans (id, name, employee_seat_limit, admin_account_limit, grace_percent, sort_order) values ($1, $2, $3, $4, 5, $5) on conflict do nothing`, [id, name, seats, admins, order]);
 
   for (const a of ACCOUNTS) {
     const exists = await c.query(`select 1 from user_accounts where builtin_key = $1 or lower(username) = $2`, [a.key, a.username]);

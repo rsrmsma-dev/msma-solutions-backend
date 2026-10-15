@@ -10,6 +10,7 @@ import * as corehr from "./corehr.js";
 import * as leave from "./leave.js";
 import * as tk from "./timekeeping.js";
 import * as payroll from "./payroll.js";
+import * as paysettings from "./paysettings.js";
 import * as loans from "./loans.js";
 import * as finalpay from "./finalpay.js";
 import * as reimb from "./reimbursements.js";
@@ -19,6 +20,9 @@ import * as orgunits from "./orgunits.js";
 import * as settings from "./settings.js";
 import * as policies from "./policies.js";
 import * as outbox from "./outbox.js";
+import * as support from "./support.js";
+import * as subscription from "./subscription.js";
+import * as notify from "./notify.js";
 import { pool, UserError } from "./db.js";
 
 // Behind a reverse proxy (nginx, a load balancer), set TRUST_PROXY=1 so each visitor's own address is
@@ -81,10 +85,13 @@ const CONSTRAINT_MESSAGES: Record<string, string> = {
   employees_basic_rate_positive: "Enter the monthly salary",
   payroll_adjustments_payroll_run_id_employee_id_fkey: "That employee isn't in this run",
   company_policies_title_ci: "There's already a policy with that title",
+  company_settings_paydays: "Paydays should be at least a week apart",
+  employee_pay_profiles_amounts: "Amounts can't be negative",
+  employee_pay_profiles_client_share: "The share charged to a client is 0 to 100%",
 };
 
 app.setErrorHandler((err, req, reply) => {
-  if (err instanceof UserError) return reply.code(err.status).send({ error: (err as Error).message });
+  if (err instanceof UserError) return reply.code(err.status).send({ error: (err as Error).message, ...(err.code ? { code: err.code } : {}) });
   const pgErr = err as { code?: string; constraint?: string; message: string };
   if (pgErr.code === "23505" || pgErr.code === "23514") {
     // The date-rule trigger raises its own readable message.
@@ -180,6 +187,7 @@ app.register(async (r) => {
   r.put<{ Params: { id: string }; Body: { supervisorId: string | null } }>("/api/corehr/employees/:id/supervisor", async (req) => (await corehr.setReportsTo(req.session!, req.params.id, req.body?.supervisorId ?? null), { ok: true }));
   r.put<{ Body: { employeeId: string } }>("/api/corehr/company-head", async (req) => (await corehr.setCompanyHead(req.session!, String(req.body?.employeeId ?? "")), { ok: true }));
   r.post<{ Params: { id: string }; Body: any }>("/api/corehr/employees/:id/separation", (req) => corehr.recordSeparation(req.session!, req.params.id, req.body));
+  r.post<{ Params: { id: string }; Body: any }>("/api/corehr/employees/:id/regularize", (req) => corehr.regularize(req.session!, req.params.id, req.body));
   r.delete<{ Params: { id: string } }>("/api/corehr/employees/:id/separation", (req) => corehr.cancelSeparation(req.session!, req.params.id));
   r.patch<{ Params: { id: string }; Body: unknown }>("/api/corehr/documents/:id", async (req) => (await corehr.updateDocument(req.session!, req.params.id, req.body), { ok: true }));
 
@@ -232,6 +240,11 @@ app.register(async (r) => {
   r.get("/api/outbox", (req) => outbox.listOutbox(req.session!));
   r.post<{ Body: any }>("/api/outbox", (req) => outbox.queueFromBrowser(req.session!, req.body));
   r.delete("/api/outbox", async (req) => (await outbox.clearOutbox(req.session!), ok));
+  // The bell: only ever the signed-in person's own notifications.
+  r.get("/api/notifications", (req) => notify.listMine(req.session!));
+  r.get("/api/notifications/unread-count", (req) => notify.unreadCount(req.session!));
+  r.post("/api/notifications/read", async (req) => (await notify.markAllRead(req.session!), ok));
+  r.post<{ Params: { id: string } }>("/api/notifications/:id/read", async (req) => (await notify.markRead(req.session!, req.params.id), ok));
 });
 
 // ---- Leave ----
@@ -292,9 +305,13 @@ app.register(async (r) => {
   r.post<{ Params: { id: string }; Body: any }>("/api/payroll/runs/:id/adjustments", (req) => payroll.addAdjustment(req.session!, req.params.id, req.body));
   r.post<{ Params: { id: string; adj: string }; Body: any }>("/api/payroll/runs/:id/adjustments/:adj/remove", (req) => payroll.removeAdjustment(req.session!, req.params.id, req.params.adj, req.body));
   r.post<{ Params: { id: string }; Body: any }>("/api/payroll/runs/:id/approve", (req) => payroll.approveRun(req.session!, req.params.id, req.body));
+  r.post<{ Params: { id: string } }>("/api/payroll/runs/:id/review", (req) => payroll.reviewRun(req.session!, req.params.id));
   r.delete<{ Params: { id: string } }>("/api/payroll/runs/:id", async (req) => (await payroll.deleteRun(req.session!, req.params.id), ok));
   r.get("/api/payroll/my-payslips", (req) => payroll.myPayslips(req.session!));
   // Loans & deductions, and final pay.
+  r.get("/api/payroll/pay-settings", (req) => paysettings.getPaySettings(req.session!));
+  r.put<{ Body: any }>("/api/payroll/paydays", (req) => paysettings.savePaydays(req.session!, req.body));
+  r.put<{ Params: { id: string }; Body: any }>("/api/payroll/pay-profiles/:id", (req) => paysettings.savePayProfile(req.session!, req.params.id, req.body));
   r.get("/api/payroll/loans", (req) => loans.listLoans(req.session!));
   r.post<{ Body: any }>("/api/payroll/loans", (req) => loans.saveLoan(req.session!, undefined, req.body));
   r.put<{ Params: { id: string }; Body: any }>("/api/payroll/loans/:id", (req) => loans.saveLoan(req.session!, req.params.id, req.body));
@@ -314,7 +331,7 @@ app.register(async (r) => {
   r.post<{ Body: any }>("/api/reimbursements/claims", { bodyLimit: 8 * 1024 * 1024 }, (req) => reimb.fileClaim(req.session!, req.body));
   r.post<{ Params: { id: string }; Body: { approve?: boolean; note?: string } }>("/api/reimbursements/claims/:id/decision", (req) =>
     reimb.decideClaim(req.session!, req.params.id, !!req.body?.approve, String(req.body?.note ?? "")));
-  r.post<{ Body: any }>("/api/reimbursements/claims/pay", (req) => reimb.payClaimsByTransfer(req.session!, req.body));
+  r.post<{ Body: any }>("/api/reimbursements/claims/pay", (req) => reimb.releaseClaims(req.session!, req.body));
   r.get<{ Params: { id: string } }>("/api/files/:id", async (req, reply) => {
     const f = await reimb.readFile(req.session!, req.params.id);
     return sendFile(reply, f, 3600);
@@ -333,6 +350,7 @@ app.register(async (r) => {
   r.post<{ Params: { id: string } }>("/api/me/benefits/:id/confirm", (req) => records.confirmBenefit(req.session!, req.params.id));
   r.delete<{ Params: { id: string } }>("/api/me/benefits/:id", async (req) => (await records.removeBenefit(req.session!, req.params.id), ok));
   r.get("/api/me/trainings", (req) => records.listMyTrainings(req.session!));
+  r.put<{ Params: { id: string }; Body: { status?: string } }>("/api/me/trainings/:id/status", (req) => records.setMyTrainingStatus(req.session!, req.params.id, String(req.body?.status ?? "")));
   r.put<{ Params: { id: string }; Body: { status?: string } }>("/api/trainings/:id/status", (req) => records.setTrainingStatus(req.session!, req.params.id, String(req.body?.status ?? "")));
   r.get("/api/me/license", (req) => records.myLicense(req.session!));
   r.get("/api/licenses", (req) => records.listLicenses(req.session!));
@@ -342,6 +360,10 @@ app.register(async (r) => {
   r.delete<{ Params: { id: string } }>("/api/me/certificates/:id", async (req) => (await records.cancelCertificate(req.session!, req.params.id), ok));
   r.get("/api/certificates", (req) => records.listCertificatesForReview(req.session!));
   r.put<{ Params: { id: string }; Body: { status?: string } }>("/api/certificates/:id/status", (req) => records.setCertificateStatus(req.session!, req.params.id, String(req.body?.status ?? "")));
+  r.post<{ Params: { id: string } }>("/api/certificates/:id/issue", (req) => records.issueCertificate(req.session!, req.params.id));
+  r.post<{ Params: { id: string } }>("/api/certificates/:id/ready", (req) => records.markCertificateReady(req.session!, req.params.id));
+  r.post<{ Params: { id: string } }>("/api/certificates/:id/released", (req) => records.markCertificateReleased(req.session!, req.params.id));
+  r.post<{ Params: { id: string }; Body: { reason?: string } }>("/api/certificates/:id/decline", (req) => records.declineCertificate(req.session!, req.params.id, req.body?.reason));
 });
 
 // ---- Administration & Security ----
@@ -380,7 +402,25 @@ app.register(async (r) => {
   r.put<{ Body: any }>("/api/admin/settings", { bodyLimit: 2 * 1024 * 1024 }, (req) => admin.saveSettings(req.session!, req.body));
   r.get("/api/admin/audit", (req) => admin.listAdminAudit(req.session!));
 
-  // Subscription plan and seats (SaaS).
+  // Support tickets (Administration > Support).
+  r.get("/api/support/tickets", (req) => support.listTickets(req.session!));
+  r.post<{ Body: any }>("/api/support/tickets", (req) => support.fileTicket(req.session!, req.body));
+  r.post<{ Params: { id: string }; Body: any }>("/api/support/tickets/:id/messages", (req) => support.replyTicket(req.session!, req.params.id, req.body));
+  r.patch<{ Params: { id: string }; Body: any }>("/api/support/tickets/:id", (req) => support.updateTicket(req.session!, req.params.id, req.body));
+  r.post<{ Params: { id: string } }>("/api/support/tickets/:id/close", (req) => support.closeTicket(req.session!, req.params.id));
+
+  // Subscription & seat limits: the company's plan (Super Admin, HR), Clients & Subscriptions (System Admin).
+  r.get("/api/subscription", (req) => subscription.getSubscription(req.session!));
+  r.post("/api/subscription/seat-check", (req) => subscription.seatCheck(req.session!));
+  r.post<{ Body: any }>("/api/subscription/upgrade-requests", (req) => subscription.requestUpgrade(req.session!, req.body));
+  r.get("/api/subscription/clients", (req) => subscription.listClients(req.session!));
+  r.get("/api/subscription/plans", (req) => subscription.listPlans(req.session!));
+  r.get("/api/subscription/events", (req) => subscription.listEvents(req.session!));
+  r.put<{ Params: { id: string }; Body: any }>("/api/subscription/clients/:id/plan", (req) => subscription.changePlan(req.session!, req.params.id, req.body));
+  r.put<{ Params: { id: string }; Body: any }>("/api/subscription/clients/:id/seat-override", (req) => subscription.setSeatOverride(req.session!, req.params.id, req.body));
+  r.put<{ Params: { id: string }; Body: any }>("/api/subscription/clients/:id/extension", (req) => subscription.setExtension(req.session!, req.params.id, req.body));
+
+  // Older plan screen (before seat limits counted employees); the website no longer calls these.
   r.get("/api/admin/subscription", (req) => admin.getSubscription(req.session!));
   r.put<{ Body: any }>("/api/admin/subscription", (req) => admin.saveSubscription(req.session!, req.body));
 });

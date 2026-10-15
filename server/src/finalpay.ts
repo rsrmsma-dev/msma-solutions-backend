@@ -9,6 +9,7 @@ import { audit, can, seen, type Session } from "./auth";
 import { open, seal } from "./crypto";
 import { clean, pool, tx, UserError, type Db } from "./db";
 import { demandPayroll, paidByLoan, settleLoans } from "./loans";
+import { tellAssigned, tellEmployees } from "./notify";
 
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null) ?? undefined);
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
@@ -146,6 +147,8 @@ export async function releaseCase(s: Session, body: any) {
     }
     // The reference stays out of the trail (it's encrypted in the table).
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "Payroll", action: "Released final pay", target: nameOf(e), employeeNo: employeeId, detail: money(total) });
+    await tellEmployees(c, s, employeeId, "payslip", "approved", "Your final pay was released", `${money(total)} · reference ${reference}.`);
+    await tellAssigned(c, s, "edit", "people", "separation", "update", `Final pay released for ${nameOf(e)}`, `${money(total)} by ${s.name} (${reference}).`);
     return caseJson(next);
   });
 }

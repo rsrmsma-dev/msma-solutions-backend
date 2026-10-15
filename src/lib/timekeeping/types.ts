@@ -20,6 +20,8 @@ export interface ShiftTemplate {
   flexible?: boolean;
   /** Hours to work on a flexible day, not counting the break. */
   requiredHours?: number;
+  /** A shorter Saturday on a six-day week: the shift ends at this time, with no lunch break. */
+  saturdayEnd?: string;
   active: boolean;
 }
 
@@ -108,6 +110,9 @@ export interface TimeRequest {
   date: string;
   type: "overtime" | "undertime";
   minutes: number;
+  /** When the overtime starts and ends (ISO); minutes = end − start. Missing on older requests. */
+  startAt?: string;
+  endAt?: string;
   reason: string;
   status: "pending" | "approved" | "declined";
   filedBy: string;

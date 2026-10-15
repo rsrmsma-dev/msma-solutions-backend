@@ -1,6 +1,6 @@
 # HeyHR data dictionary
 
-PostgreSQL schema for the HRIS: 57 tables in 7 areas. The DDL is in [`schema.sql`](schema.sql).
+PostgreSQL schema for the HRIS: 63 tables in 7 areas. The DDL is in [`schema.sql`](schema.sql).
 
 Conventions: `uuid` primary keys; money is `numeric(12,2)` in PHP; times are `timestamptz`; allowed values are enforced with `CHECK`. Computed figures (leave balances, daily attendance results, compliance status) are not stored.
 
@@ -42,6 +42,8 @@ Single row of company-wide settings: identity, sign-in security, working time an
 | `overtime_threshold_minutes` | smallint | No |  | `0` | Extra time after a shift shorter than this isn't overtime (Settings > Scheduling). |
 | `default_break_minutes` | smallint | No |  | `60` | Lunch break pre-filled for new shifts. |
 | `schedule_publish_lead_days` | smallint | No |  | `7` | How many days ahead schedules are published; stored for when there is a publishing step. |
+| `payday_first` | smallint | No |  | `10` | First payday of the month: the first cut-off closes and is paid on this day (Payroll > Pay details > Paydays). |
+| `payday_second` | smallint | No |  | `25` | Second payday of the month, at least a week after the first; 31 means the last day of the month. |
 
 ### `org_units`
 
@@ -54,9 +56,11 @@ The organization tree: one company, its branches, their departments and teams (c
 | `name` | text | No |  |  | Display name, e.g. Cebu HQ, Tax Advisory, RPM. |
 | `code` | text | No |  |  | Short code used in tables and IDs, e.g. CEB, TAX. |
 | `parent_id` | uuid | Yes | FK → org_units |  | Parent unit; null only for the company. |
-| `head_employee_id` | varchar(20) | Yes | FK → employees |  | Head of the unit (department head, partner). |
+| `head_employee_id` | varchar(20) | Yes | FK → employees |  | Head of the unit (department head, partner; a branch's manager). |
 | `address` | text | Yes |  |  | Street address; branches only. |
 | `is_active` | boolean | No |  | `true` | Inactive units stay for history but can't take new people. |
+| `contact_name` | text | Yes |  |  | Contact person at the office; branches only. |
+| `contact_phone` | text | Yes |  |  | Contact person's phone (PH mobile or landline); branches only. |
 
 ### `positions`
 
@@ -362,6 +366,17 @@ COE and other certificates employees request.
 | `status` | text | No |  | `'Pending'` | Status. Allowed: `Pending`, `Ready for pickup`, `Released`. |
 | `requested_at` | timestamptz | No |  | `now()` | Request time. |
 | `released_at` | timestamptz | Yes |  |  | Release time. |
+| `delivery` | text | Yes |  |  | How it reached the employee: a digital copy to download, or a signed copy picked up from HR. Allowed: `digital`, `pickup`. |
+| `handled_by` | uuid | Yes | FK → user_accounts |  | HR account that took the last step (issued, ready for pickup, released, declined). |
+| `handled_by_name` | text | Yes |  |  | Name of who took the last step, kept if the account goes. |
+| `handled_at` | timestamptz | Yes |  |  | When the last step was taken. |
+| `decline_reason` | text | Yes |  |  | Why HR declined it, shown to the employee; encrypted by the app (AES-256-GCM). When set the request is declined (shown as Declined; status stays Pending). |
+| `certificate_no` | text | Yes | UQ |  | Number of the issued certificate, e.g. COE-2026-0001 (per type and year). |
+| `issued_statement` | text | Yes |  |  | The certificate's exact wording when issued, made from the employee's record at that time (HR's filed copy and the employee's download); encrypted by the app (AES-256-GCM). |
+| `issued_purpose` | text | Yes |  |  | Purpose printed on the issued certificate. |
+| `issued_at` | timestamptz | Yes |  |  | When it was issued. |
+| `issued_by` | uuid | Yes | FK → user_accounts |  | HR account that issued it. |
+| `issued_by_name` | text | Yes |  |  | Name of who issued it, kept if the account goes. |
 
 ## Timekeeping & attendance
 
@@ -384,6 +399,7 @@ Work shifts: Busy season, Peak season, Mid shift, Flexible time.
 | `is_flexible` | boolean | No |  | `false` | Clock in any time in the window; only hours worked count. |
 | `required_hours` | numeric(4,2) | Yes |  |  | Hours a flexible day needs. |
 | `is_active` | boolean | No |  | `true` | Retired shifts stay for history. |
+| `saturday_end` | time | Yes |  |  | When Saturday ends on a six-day week (a shorter day, no break); empty = Saturday ends at end_time. |
 
 ### `schedule_overrides`
 
@@ -456,6 +472,8 @@ Overtime and undertime requests.
 | `decided_by_name` | text | Yes |  |  | Name of who decided, kept if the account goes. |
 | `decided_at` | timestamptz | Yes |  |  | When it was decided. |
 | `decision_note` | text | Yes |  |  | Note from the approver to the employee. |
+| `start_at` | timestamptz | Yes |  |  | When the overtime or undertime starts; minutes = end_at - start_at. Empty for requests filed before 030. |
+| `end_at` | timestamptz | Yes |  |  | When it ends (can be the next day). |
 
 ### `punch_fix_requests`
 
@@ -658,6 +676,9 @@ One payroll per cutoff. Draft runs recompute from attendance; approved runs are 
 | `approved_by_name` | text | Yes |  |  | Name of who approved it. |
 | `approved_at` | timestamptz | Yes |  |  | When approved. |
 | `payslips_released_at` | timestamptz | Yes |  |  | When employees could see their payslips. |
+| `reviewed_by` | uuid | Yes | FK → user_accounts |  | Account that reviewed the run (Summary sheet "Reviewed by"). |
+| `reviewed_by_name` | text | Yes |  |  | Name of who reviewed it, kept if the account goes. |
+| `reviewed_at` | timestamptz | Yes |  |  | When it was reviewed. |
 
 ### `payroll_run_lines`
 
@@ -723,6 +744,27 @@ Loans and other recurring deductions (SSS and Pag-IBIG loans, cash advances, com
 | `closed_by_name` | text | Yes |  |  | Name of who closed it. |
 | `closed_at` | timestamptz | Yes |  |  | When it was stopped or settled. |
 
+### `employee_pay_profiles`
+
+Each employee's pay settings (Payroll > Pay details): work week, allowances and tax-free pay the payroll engine uses. No row = 5-day week and no allowances.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `employee_id` | varchar(20) | No | PK, FK → employees |  | Whose pay settings. |
+| `work_week` | text | No |  | `'5-day'` | 5-day: Monday to Friday, 8 hours. 6-day: Monday to Friday 7 hours, Saturday 5. Allowed: `5-day`, `6-day`. |
+| `transport_allowance` | numeric(12,2) | No |  | `0` | Transport allowance for a full cut-off, PHP; prorated by days attended, not taxed. |
+| `ot_meal_rate` | numeric(10,2) | No |  | `0` | Paid for each day with approved overtime, PHP. |
+| `de_minimis` | numeric(12,2) | No |  | `0` | De minimis benefits inside the basic pay each cut-off, PHP; not taxed. |
+| `other_non_taxable` | numeric(12,2) | No |  | `0` | Other non-taxable pay inside the basic pay each cut-off, PHP. |
+| `updated_at` | timestamptz | No |  | `now()` | Last change. |
+| `updated_by` | uuid | Yes | FK → user_accounts |  | Account that made the last change. |
+| `updated_by_name` | text | Yes |  |  | Name of who made the last change, kept if the account goes. |
+| `client_share` | numeric(5,2) | No |  | `0` | Percent of the salary charged to Sphinx or a client (FT_MSMA % Sphinx), 0-100; booked to 14002 Advances - Sphinx. |
+| `client` | text | No |  | `''` | Who the share is charged to (FT_MSMA client column); empty when nothing is charged. |
+| `skip_sss` | boolean | No |  | `false` | True: no SSS taken from this person (sheet C typed 0). |
+| `skip_philhealth` | boolean | No |  | `false` | True: no PhilHealth taken from this person (sheet C typed 0). |
+| `skip_pagibig` | boolean | No |  | `false` | True: no Pag-IBIG taken from this person (sheet C typed 0). |
+
 ### `final_pay_cases`
 
 Final pay (back pay) for someone leaving. Opened when HR records a separation or by Accounting; releasing it freezes the figures, settles the loans and pays out approved reimbursements.
@@ -773,10 +815,26 @@ Expense claims with a receipt photo. The employee's approver endorses them, then
 | `paid_by_name` | text | Yes |  |  | Name of who paid it, kept if the account goes. |
 | `payout_method` | text | Yes |  |  | How it was paid: with a payroll run, by bank transfer, or in final pay. Allowed: `payroll`, `transfer`, `final pay`. |
 | `payout_reference` | text | Yes |  |  | The payroll run, the transfer reference, or Final pay; encrypted by the app (AES-256-GCM). |
+| `release_method` | text | Yes |  |  | How Accounting released it straight to the employee: cash, bank transfer, e-wallet or check (payout_method is then 'transfer'). Empty for claims paid with payroll or final pay, or released before this was recorded. Allowed: `cash`, `transfer`, `e-wallet`, `check`. |
 
 ## Access, workflows & audit
 
 Who can sign in and what they can do, how requests get approved, and the audit trail for every sensitive action.
+
+### `subscription_plans`
+
+The plans a client can be on (Administration > Clients & Subscriptions): employee seats, admin accounts and grace. Set up by our team.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | text | No | PK |  | Plan id, e.g. plan-starter. |
+| `name` | text | No | UQ |  | Plan name, e.g. Starter. |
+| `employee_seat_limit` | integer | No |  |  | Employees the plan covers: records that aren't Separated. |
+| `admin_account_limit` | integer | No |  |  | Active HR, Approver and Accounting logins the plan covers. |
+| `grace_percent` | smallint | No |  | `0` | How far past either limit adds are still allowed, in percent, rounded down to whole seats. |
+| `is_active` | boolean | No |  | `true` | Offered when choosing a plan. |
+| `sort_order` | smallint | No |  | `0` | Order in the plan list. |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
 
 ### `subscriptions`
 
@@ -800,6 +858,27 @@ The company's HRIS plan (SaaS): plan, seat limit and billing period. One row per
 | `created_by` | uuid | Yes | FK → user_accounts |  | Account that set it up. |
 | `updated_at` | timestamptz | No |  | `now()` | Last change. |
 | `updated_by` | uuid | Yes | FK → user_accounts |  | Account that made the last change. |
+| `plan_id` | text | Yes | FK → subscription_plans |  | The plan in force (its seat, admin-account and grace limits); empty = no plan set, so nothing is limited. |
+| `seat_limit_override` | integer | Yes |  |  | Employee seat limit our team set for this client in place of the plan's; empty = the plan's. |
+| `extension_seats` | integer | Yes |  |  | Temporary extra employee seats, until extension_until. |
+| `extension_until` | date | Yes |  |  | Last day the temporary extra seats apply. |
+| `last_seat_level` | smallint | No |  | `0` | Highest seat threshold (percent of the limit) already logged and told to System Admins; falls back when usage drops, so each crossing is told once. Allowed: `0`, `80`, `90`, `100`. |
+| `last_seat_alert` | smallint | Yes |  |  | Highest seat threshold Super Admins and HR were already told about; empty = none yet. Allowed: `0`, `80`, `90`, `100`. |
+
+### `subscription_events`
+
+Log of seat alerts, refused adds, upgrade requests and plan changes (Administration > Clients & Subscriptions).
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `kind` | text | No |  |  | What happened. Allowed: `threshold`, `blocked`, `upgrade-request`, `plan-changed`, `seat-override`, `extension`. |
+| `message` | text | No |  |  | What happened, in words (an upgrade request includes its note). |
+| `by_account` | uuid | Yes | FK → user_accounts |  | Account that did it; empty for automatic alerts and refusals. |
+| `by_name` | text | Yes |  |  | Name of who did it, kept if the account goes. |
+| `seats` | text | No |  |  | Employee seats used / limit at that moment, e.g. 17 / 20. |
+| `admins` | text | No |  |  | Admin accounts used / limit at that moment, e.g. 6 / 8. |
+| `occurred_at` | timestamptz | No |  | `now()` | When. |
 
 ### `roles`
 
@@ -927,6 +1006,57 @@ Append-only trail: sign-ins, admin changes, 201 File views and edits, timekeepin
 | `target` | text | No |  |  | What it touched, e.g. Valid Government ID. |
 | `detail` | text | Yes |  |  | Human-readable detail. |
 | `data` | jsonb | Yes |  |  | Before/after values for edits. |
+
+### `support_tickets`
+
+Problems and questions the client's Super Admins, HR and Accounting send to our support team (Administration > Support). Our System Admins answer them and set status and priority.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `ticket_no` | integer | No | UQ |  | Ticket number shown to people, from 1001 up. |
+| `subject` | text | No |  |  | Short title. |
+| `category` | text | No |  |  | What it's about. Allowed: `Bug or error`, `How do I…`, `Account or sign-in`, `Payroll`, `Data fix`, `Billing`, `Feature request`. |
+| `priority` | text | No |  | `'normal'` | How urgent it is. Allowed: `low`, `normal`, `high`, `urgent`. |
+| `status` | text | No |  | `'open'` | Open, in progress, waiting for the client, resolved or closed. Allowed: `open`, `in_progress`, `waiting`, `resolved`, `closed`. |
+| `filed_by` | uuid | Yes | FK → user_accounts |  | Account that filed it. |
+| `filed_by_name` | text | No |  |  | Name of who filed it, kept if the account goes. |
+| `page` | text | Yes |  |  | The page they were on, to help reproduce it. |
+| `assignee` | text | Yes |  |  | Who on our support team is on it. |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
+| `updated_at` | timestamptz | No |  | `now()` | Last reply or change. |
+
+### `support_ticket_messages`
+
+The conversation on a support ticket, oldest first.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `ticket_id` | uuid | No | FK → support_tickets |  | The ticket. |
+| `side` | text | No |  |  | Who wrote it: the client's people, or our support team. Allowed: `client`, `support`. |
+| `author_id` | uuid | Yes | FK → user_accounts |  | Account that wrote it. |
+| `author_name` | text | No |  |  | Name shown on the message (Support team for our replies). |
+| `body` | text | No |  |  | The message, encrypted by the app (AES-256-GCM). |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
+
+### `notifications`
+
+Bell notifications: one row per person told about a request, a decision or a change (the bell in the top bar). Created by the server with the change that causes them.
+
+| Column | Type | Null | Key | Default | Description |
+|---|---|---|---|---|---|
+| `id` | uuid | No | PK | `gen_random_uuid()` | Primary key. |
+| `account_id` | uuid | No | FK → user_accounts |  | Who it's for (the sign-in that sees it in their bell). |
+| `topic` | text | No |  |  | What it's about, e.g. leave, claim, certificate, subscription (src/lib/noticeLinks.ts). |
+| `kind` | text | No |  |  | Which icon the bell shows. Allowed: `request`, `approved`, `rejected`, `update`, `seat`, `alert`. |
+| `title` | text | No |  |  | Headline, encrypted by the app (AES-256-GCM): it can name people and amounts. |
+| `body` | text | No |  |  | Detail, encrypted by the app (AES-256-GCM). |
+| `link` | text | Yes |  |  | The page it opens for this person's role; empty = nowhere. |
+| `by_account` | uuid | Yes | FK → user_accounts |  | Account whose action caused it; empty for automatic alerts. |
+| `by_name` | text | Yes |  |  | Name of who caused it, kept if the account goes. |
+| `created_at` | timestamptz | No |  | `now()` | When the row was created. |
+| `read_at` | timestamptz | Yes |  |  | When the person read it; empty = unread. |
 
 ## Announcements & compliance
 

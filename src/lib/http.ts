@@ -10,9 +10,12 @@ export const SIGNED_OUT_EVENT = "heyhr:signed-out";
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  /** The server's error code, when it sends one (e.g. SEAT_LIMIT_REACHED). */
+  code?: string;
+  constructor(message: string, status: number, code?: string) {
     super(message);
     this.status = status;
+    if (code) this.code = code;
   }
 }
 
@@ -31,10 +34,10 @@ export async function api<T>(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
   const data = res.status === 204 ? undefined : await res.json().catch(() => undefined);
   if (!res.ok) {
     if (res.status === 401 && !path.startsWith("/auth/")) window.dispatchEvent(new Event(SIGNED_OUT_EVENT));
-    const message = (data as { error?: string } | undefined)?.error;
+    const { error: message, code } = (data as { error?: string; code?: string } | undefined) ?? {};
     // No message from our server: the dev proxy couldn't reach it (it isn't running).
     if (!message && res.status >= 500) throw new ApiError("Can't reach the HeyHR server. Start it with: npm run server", res.status);
-    throw new ApiError(message ?? "Something went wrong. Try again.", res.status);
+    throw new ApiError(message ?? "Something went wrong. Try again.", res.status, code);
   }
   return data as T;
 }

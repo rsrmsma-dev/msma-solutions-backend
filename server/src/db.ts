@@ -37,7 +37,8 @@ export async function tx<T>(fn: (c: pg.PoolClient) => Promise<T>): Promise<T> {
 
 /** An error whose message is safe to show the user (a 4xx). */
 export class UserError extends Error {
-  constructor(message: string, public status = 400) {
+  /** `code` goes out with the message for errors the website tells apart (e.g. SEAT_LIMIT_REACHED). */
+  constructor(message: string, public status = 400, public code?: string) {
     super(message);
   }
 }
@@ -99,3 +100,121 @@ export async function need020(db: Db = pool) {
   if (!(await schema020(db))) throw new UserError("The database needs an update (migration 020) before this can be saved. Ask your administrator to apply it.", 503);
 }
 
+// Migration 023 (an office's contact person). Until it's applied, offices are listed without one and saving an office says what's missing.
+let has023 = false;
+export async function need023(db: Db = pool) {
+  if (!has023) {
+    const { rows } = await db.query(`select exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'org_units' and column_name = 'contact_phone') as ok`);
+    has023 = rows[0].ok === true;
+  }
+  if (!has023) throw new UserError("The database needs an update (migration 023) before this can be saved. Ask your administrator to apply it.", 503);
+}
+
+
+// Migration 024 (how a claim was released, certificate issuing / pickup / decline, support tickets). Until
+// it's applied, tickets are empty, certificates list without the new details, and saves say what's missing.
+let has024 = false;
+let warned024 = false;
+export async function schema024(db: Db = pool): Promise<boolean> {
+  if (has024) return true;
+  const { rows } = await db.query(
+    `select to_regclass('support_tickets') is not null and to_regclass('support_ticket_messages') is not null
+            and exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'certificate_requests' and column_name = 'issued_statement')
+            and exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'reimbursement_claims' and column_name = 'release_method') as ok`,
+  );
+  has024 = rows[0].ok === true;
+  if (!has024 && !warned024) {
+    warned024 = true;
+    console.warn("Database migration 024_claims_certificates_support isn't applied: support tickets are empty, and releasing claims other than by bank transfer and issuing or declining certificates wait until it is.");
+  }
+  return has024;
+}
+
+/** For saves that need migration 024. */
+export async function need024(db: Db = pool) {
+  if (!(await schema024(db))) throw new UserError("The database needs an update (migration 024) before this can be saved. Ask your administrator to apply it.", 503);
+}
+
+// Migration 025 (subscription plans, the client's seat override / extension / alert levels, the
+// subscription event log). Until it's applied there is no plan, so nothing is limited, the event log
+// is empty, and the System Admin's changes say what's missing.
+let has025 = false;
+let warned025 = false;
+export async function schema025(db: Db = pool): Promise<boolean> {
+  if (has025) return true;
+  const { rows } = await db.query(
+    `select to_regclass('subscription_plans') is not null and to_regclass('subscription_events') is not null
+            and exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'subscriptions' and column_name = 'last_seat_alert') as ok`,
+  );
+  has025 = rows[0].ok === true;
+  if (!has025 && !warned025) {
+    warned025 = true;
+    console.warn("Database migration 025_subscription_seats isn't applied: no plan is set, so employee seats and admin accounts aren't limited, until it is.");
+  }
+  return has025;
+}
+
+/** For saves that need migration 025. */
+export async function need025(db: Db = pool) {
+  if (!(await schema025(db))) throw new UserError("The database needs an update (migration 025) before this can be saved. Ask your administrator to apply it.", 503);
+}
+
+// Migration 026 (bell notifications). Until it's applied, nothing is sent to the bell, the bell is
+// empty, and every action works as before.
+let has026 = false;
+let warned026 = false;
+export async function schema026(db: Db = pool): Promise<boolean> {
+  if (has026) return true;
+  const { rows } = await db.query(`select to_regclass('notifications') is not null as ok`);
+  has026 = rows[0].ok === true;
+  if (!has026 && !warned026) {
+    warned026 = true;
+    console.warn("Database migration 026_notifications isn't applied: bell notifications aren't sent or shown until it is.");
+  }
+  return has026;
+}
+
+// Migration 027 (paydays, each employee's pay settings, a six-day shift's Saturday end). Until it's
+// applied, the paydays are the 10th and 25th, everyone is on a 5-day week with no allowances, shifts
+// have no separate Saturday end, and saving any of these says what's missing.
+let has027 = false;
+let warned027 = false;
+export async function schema027(db: Db = pool): Promise<boolean> {
+  if (has027) return true;
+  const { rows } = await db.query(
+    `select to_regclass('employee_pay_profiles') is not null
+            and exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'company_settings' and column_name = 'payday_first')
+            and exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'shift_templates' and column_name = 'saturday_end') as ok`,
+  );
+  has027 = rows[0].ok === true;
+  if (!has027 && !warned027) {
+    warned027 = true;
+    console.warn("Database migration 027_pay_settings isn't applied: paydays stay on the 10th and 25th, pay settings and Saturday end times can't be saved until it is.");
+  }
+  return has027;
+}
+
+// Migration 028 (share of salary charged to a client; leave earned by length of service). Until it's
+// applied, nobody's salary is charged to a client and that kind of leave type can't be saved.
+let has028 = false;
+export async function schema028(db: Db = pool): Promise<boolean> {
+  if (has028) return true;
+  const { rows } = await db.query(`select exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'employee_pay_profiles' and column_name = 'client_share') as ok`);
+  has028 = rows[0].ok === true;
+  return has028;
+}
+
+// Migration 030 (start and end times on overtime and undertime requests). Until it's applied, a
+// request keeps only its minutes.
+let has030 = false;
+export async function schema030(db: Db = pool): Promise<boolean> {
+  if (has030) return true;
+  const { rows } = await db.query(`select exists (select 1 from information_schema.columns where table_schema = current_schema() and table_name = 'time_requests' and column_name = 'start_at') as ok`);
+  has030 = rows[0].ok === true;
+  return has030;
+}
+
+/** For saves that need migration 027. */
+export async function need027(db: Db = pool) {
+  if (!(await schema027(db))) throw new UserError("The database needs an update (migration 027) before this can be saved. Ask your administrator to apply it.", 503);
+}

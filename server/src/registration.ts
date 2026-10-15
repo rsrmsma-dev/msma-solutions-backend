@@ -9,7 +9,6 @@
 
 import { randomBytes } from "node:crypto";
 import { audit, hashPassword } from "./auth.js";
-import { assertSeatFree } from "./admin.js";
 import { tx, UserError, type Db } from "./db.js";
 
 /** Slows down guessing: per address, at most this many tries in the window. */
@@ -79,7 +78,7 @@ export async function register(ip: string, body: any) {
     // Only reached with all three right, so this doesn't reveal anything to a guesser.
     const existing = (await c.query(`select username from user_accounts where employee_id = $1`, [e.employee_id])).rows[0];
     if (existing) throw new UserError(`You're already registered (username ${existing.username}). Ask HR for your temporary password, or to reset it.`);
-    await assertSeatFree(c);
+    // An Employee sign-in takes no seat: seats are employee records (HR's Add employee checks them).
     const username = await usernameFor(c, email, e.employee_id);
     const displayName = `${e.first_name} ${e.last_name}`;
     // A random password nobody knows: they sign in only after HR gives them a temporary one.

@@ -7,8 +7,12 @@ import { createHash } from "node:crypto";
 import { claimProblems, type ClaimInput } from "../../src/lib/reimbursements/rules";
 import { CATEGORIES } from "../../src/lib/reimbursements/store";
 import { audit, can, demand, seen, type Session } from "./auth";
-import { clean, pool, schema020, tx, UserError, type Db } from "./db";
+import { clean, need024, pool, schema020, schema024, tx, UserError, type Db } from "./db";
 import { open, openBytes, seal, sealBytes } from "./crypto";
+import { peso, tellApprover, tellAssigned, tellEmployees, who } from "./notify";
+
+/** "Meals", or the type written in for Other. */
+const what = (r: any) => (r.category === "Other" ? (r.other_type ?? "Other") : r.category);
 
 const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : (v as string | null) ?? undefined);
 const MAX_RECEIPT_BYTES = 4 * 1024 * 1024;
@@ -18,7 +22,7 @@ const claimJson = (r: any) => clean({
   amount: r.amount, description: r.description, receipt: `/api/files/${r.receipt_file_id}`, status: r.status, filedAt: iso(r.filed_at),
   decidedBy: r.decided_by_name, decidedAt: iso(r.decided_at), note: r.decision_note,
   approverDecidedBy: r.approver_decided_by_name, approverDecidedAt: iso(r.approver_decided_at), approverNote: r.approver_note,
-  paidAt: iso(r.paid_at), paidBy: r.paid_by_name, payoutMethod: r.payout_method, payoutRef: r.payout_reference ? open(r.payout_reference) : null,
+  paidAt: iso(r.paid_at), paidBy: r.paid_by_name, payoutMethod: r.release_method ?? r.payout_method, payoutRef: r.payout_reference ? open(r.payout_reference) : null,
 });
 
 /** The claims they may see: their own, their team's (approvers), or everyone's (Accounting, Super Admin). */
@@ -66,6 +70,7 @@ export async function fileClaim(s: Session, body: any) {
         Math.round(input.amount * 100) / 100, input.description.trim(), f.id],
     );
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "Reimbursements", action: "Filed claim", target: input.merchant.trim(), employeeNo: input.employeeId, detail: `₱${r.amount.toLocaleString("en-PH")} · ${input.purchaseDate}` });
+    await tellApprover(c, s, r.employee_id, "claim", "request", `${await who(c, r.employee_id)} filed a ${what(r)} claim`, `${peso(r.amount)} at ${r.merchant}. Review it under Approvals.`);
     return claimJson(r);
   });
 }
@@ -97,30 +102,50 @@ export async function decideClaim(s: Session, id: string, approve: boolean, note
         );
     const action = step === "approve" ? (approve ? "Endorsed claim" : "Rejected claim") : approve ? "Approved claim" : "Rejected claim";
     await audit(c, { actorId: s.accountId, actorName: s.name, module: "Reimbursements", action, target: r.merchant, employeeNo: r.employee_id, detail: `₱${r.amount.toLocaleString("en-PH")}${why ? `: ${why}` : ""}` });
+    const label = `${what(next)} claim (${peso(next.amount)})`;
+    if (next.status === "endorsed") {
+      await tellEmployees(c, s, next.employee_id, "claim", "update", `Your ${label} was endorsed`, `${s.name} endorsed it. Accounting gives the final approval next.`);
+      await tellAssigned(c, s, "final", "claims", "claim", "request", `${await who(c, next.employee_id)}'s ${label} is ready for final approval`, `Endorsed by ${s.name}. ${next.merchant}.`);
+    } else if (next.status === "approved") {
+      await tellEmployees(c, s, next.employee_id, "claim", "approved", `Your ${label} was approved`, `${s.name} approved it. It's paid with the next payroll or by bank transfer.`);
+    } else {
+      await tellEmployees(c, s, next.employee_id, "claim", "rejected", `Your ${label} was rejected`, `Rejected by ${s.name}.${why ? ` “${why}”` : ""}`);
+    }
     return claimJson(next);
   });
 }
 
+const METHODS = ["cash", "transfer", "e-wallet", "check"] as const;
+const HOW: Record<(typeof METHODS)[number], string> = { cash: "in cash", transfer: "by bank transfer", "e-wallet": "by e-wallet", check: "by check" };
+
 /**
- * Accounting pays approved claims by bank transfer instead of waiting for payroll (Final Approve on
- * each). Claims left unpaid go out with the next payroll run. The reference is encrypted.
+ * Accounting releases approved claims straight to the employee: cash, bank transfer, e-wallet or check
+ * (Final Approve on each). Claims never go through payroll. The reference is encrypted. Without
+ * migration 024 only a bank transfer can be recorded, as before.
  */
-export async function payClaimsByTransfer(s: Session, body: any) {
+export async function releaseClaims(s: Session, body: any) {
   const ids = Array.isArray(body?.ids) ? body.ids.map(String) : [];
+  const method = METHODS.find((m) => m === (body?.method ?? "transfer"));
   const reference = String(body?.reference ?? "").trim(), paidOn = String(body?.paidOn ?? "");
   return tx(async (c) => {
     const picked = ids.length ? (await c.query(`select * from reimbursement_claims where id::text = any($1) for update`, [ids])).rows : [];
     for (const r of picked) demand(s, "final", "claims", r.employee_id);
     if (!picked.length || picked.length !== new Set(ids).size) throw new UserError("Choose the claims to pay");
     if (picked.some((r) => r.status !== "approved" || r.paid_at)) throw new UserError("Only approved claims that aren't paid yet can be paid out");
-    if (!reference) throw new UserError("Enter the transfer reference");
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(paidOn)) throw new UserError("Enter the date it was sent");
+    if (!method) throw new UserError("Choose how it was released");
+    if (method !== "cash" && !reference) throw new UserError(method === "check" ? "Enter the check number" : "Enter the transfer reference");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(paidOn)) throw new UserError("Enter the date it was released");
+    if (reference.length > 100) throw new UserError("Keep the reference under 100 characters");
+    const withMethod = await schema024(c);
+    if (!withMethod && method !== "transfer") await need024(c);
     await c.query(
-      `update reimbursement_claims set paid_at = ($2::date + time '12:00') at time zone 'Asia/Manila', paid_by = $3, paid_by_name = $4, payout_method = 'transfer', payout_reference = $5 where id = any($1::uuid[])`,
-      [picked.map((r) => r.id), paidOn, s.accountId, s.name, seal(reference)],
+      `update reimbursement_claims set paid_at = ($2::date + time '12:00') at time zone 'Asia/Manila', paid_by = $3, paid_by_name = $4, payout_method = 'transfer', payout_reference = $5${withMethod ? ", release_method = $6" : ""} where id = any($1::uuid[])`,
+      [picked.map((r) => r.id), paidOn, s.accountId, s.name, seal(reference || "Cash"), ...(withMethod ? [method] : [])],
     );
     const total = Math.round(picked.reduce((n, r) => n + r.amount, 0) * 100) / 100;
-    for (const r of picked) await audit(c, { actorId: s.accountId, actorName: s.name, module: "Reimbursements", action: "Paid claim by transfer", target: r.merchant, employeeNo: r.employee_id, detail: `₱${r.amount.toLocaleString("en-PH")} · sent ${paidOn}` });
+    for (const r of picked) await audit(c, { actorId: s.accountId, actorName: s.name, module: "Reimbursements", action: "Released claim", target: r.merchant, employeeNo: r.employee_id, detail: `₱${r.amount.toLocaleString("en-PH")} · ${HOW[method]} · ${paidOn}` });
+    const how = method === "cash" ? "in cash" : method === "check" ? `by check (no. ${reference})` : `by ${method === "transfer" ? "bank transfer" : method} (ref. ${reference})`;
+    for (const r of picked) await tellEmployees(c, s, r.employee_id, "claim", "approved", `Your ${what(r)} reimbursement was released`, `${peso(r.amount)} released to you ${how}.`);
     return { paid: picked.length, total };
   });
 }

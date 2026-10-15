@@ -11,6 +11,8 @@ import { LIMITS } from "../../src/lib/permissions";
 import { managesAccounts, mayAssign as allowedToGive, OUR_ROLES, VISIBLE, type AccountRole } from "./hierarchy.js";
 import { seal, sealBytes } from "./crypto";
 import { turnOff as turnOffMfa } from "./mfa";
+import { assertAdminAccountAvailable, isAdminRole } from "./subscription";
+import { notify } from "./notify";
 
 const log = (db: Db, s: Session, action: string, target: string, detail = "") =>
   audit(db, { actorId: s.accountId, actorName: s.name, module: "Administration", action, target, detail });
@@ -104,7 +106,8 @@ export async function createAccount(s: Session, input: { name?: string; username
       const holder = (await c.query(`select username from user_accounts where employee_id = $1`, [employeeId])).rows[0];
       if (holder) throw new UserError(`This person already has an account (username ${holder.username}).`);
     }
-    if (!OUR_ROLES.includes(role.role_key)) await assertSeatFree(c);
+    // HR, Approver and Accounting logins count against the plan's admin accounts.
+    if (isAdminRole(role.role_key)) await assertAdminAccountAvailable(c);
     const password = await tempPassword(c);
     await c.query(
       `insert into user_accounts (username, display_name, password_hash, employee_id, role_id, must_change_password) values ($1, $2, $3, $4, $5, true)`,
@@ -136,11 +139,13 @@ export async function setAccountRole(s: Session, id: string, roleId: string) {
     const role = (await c.query(`select * from roles where id = $1`, [roleId])).rows[0];
     if (!role) throw new UserError("Choose a role");
     if (!mayAssign(s, role.role_key)) throw new UserError("You can't give or change that role.", 403);
-    if (OUR_ROLES.includes((await roleKey(c, a.role_id))!) && !OUR_ROLES.includes(role.role_key)) await assertSeatFree(c);
+    // Moving an active login into HR / Approver / Accounting takes an admin account.
+    if (a.status === "active" && isAdminRole(role.role_key) && !isAdminRole(await roleKey(c, a.role_id))) await assertAdminAccountAvailable(c);
     const before = (await c.query(`select name from roles where id = $1`, [a.role_id])).rows[0]?.name ?? "None";
     await c.query(`update user_accounts set role_id = $2 where id = $1`, [a.id, roleId]);
     await guard(c, s, a);
     await log(c, s, "Changed role", a.username, `${before} → ${role.name}`);
+    await notify(c, s, { kind: "update", topic: "account", accounts: [a.id], title: `Your role is now ${role.name}`, body: `${s.name} changed it. What you can see and do changes the next time you sign in.` });
   });
 }
 
@@ -149,6 +154,8 @@ export async function setAccountStatus(s: Session, id: string, status: string) {
   if (status !== "active" && status !== "disabled") throw new UserError("Unknown status");
   return tx(async (c) => {
     const a = await accountRow(c, s, id);
+    // Turning an HR / Approver / Accounting login back on takes an admin account.
+    if (status === "active" && a.status !== "active" && isAdminRole(await roleKey(c, a.role_id))) await assertAdminAccountAvailable(c);
     await c.query(`update user_accounts set status = $2 where id = $1`, [a.id, status]);
     await guard(c, s, a);
     // Turning an account off signs it out everywhere.
@@ -299,18 +306,9 @@ async function currentSubscription(db: Db) {
   return (await db.query(`select * from subscriptions where status in ('trial', 'active', 'past_due') order by starts_on desc, created_at desc limit 1`)).rows[0];
 }
 
-/** Seats in use: every client account, active or turned off. Our System Admin and Admin accounts don't count. */
+/** Older count for the older plan screen: every client account. Seat limits now count employees (subscription.ts). */
 async function seatsUsed(db: Db) {
   return (await db.query(`select count(*)::int as n from user_accounts a join roles r on r.id = a.role_id where r.role_key <> all($1)`, [OUR_ROLES])).rows[0].n as number;
-}
-
-/** Refuses a new client account when the plan's seats are all taken. Runs inside the account's transaction. */
-export async function assertSeatFree(db: Db) {
-  // One new account at a time, so two can't both take the last seat.
-  await db.query(`select pg_advisory_xact_lock(hashtext('seats'))`);
-  const sub = await currentSubscription(db);
-  if (sub?.seat_limit && (await seatsUsed(db)) >= sub.seat_limit)
-    throw new UserError(`All ${sub.seat_limit} seats on the ${sub.plan_name} plan are in use. Turn off an account you no longer need, or ask us to add seats.`);
 }
 
 const subscriptionJson = (r: any) => r && clean({

@@ -3,7 +3,7 @@
 // /api/corehr/state; only these changes are here.
 
 import { audit, demand, type Session } from "./auth";
-import { tx, UserError, type Db } from "./db";
+import { need023, tx, UserError, type Db } from "./db";
 
 const tidy = (v: unknown) => String(v ?? "").trim().replace(/\s+/g, " ");
 const isUuid = (v: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
@@ -36,6 +36,12 @@ export async function saveLocation(s: Session, id: string | undefined, body: any
   if (!name) throw new UserError('Name the office, for example "Iloilo"');
   if (!/^[A-Z0-9]{2,5}$/.test(code)) throw new UserError('Use a short code of 2 to 5 letters or numbers, for example "ILO"');
   if (!address) throw new UserError("Enter the office address");
+  const contactName = tidy(body?.contactName);
+  const contactPhone = tidy(body?.contactPhone);
+  const managerId = String(body?.managerId ?? "").trim() || null;
+  if (!contactName) throw new UserError("Enter the contact person at this office");
+  if (!/^(\+?63|0)\d{7,10}$/.test(contactPhone.replace(/[\s()-]/g, ""))) throw new UserError("Enter the contact person's phone, e.g. 0917 123 4567 or (032) 234 5678");
+  await need023();
   return tx(async (c) => {
     // One change to the list of offices at a time, so two can't take the same name or code.
     await c.query(`select pg_advisory_xact_lock(hashtext('org_units'))`);
@@ -45,14 +51,23 @@ export async function saveLocation(s: Session, id: string | undefined, body: any
     const others = (await c.query(`select name, code from org_units where unit_type = 'branch' and id is distinct from $1`, [existing?.id ?? null])).rows;
     if (others.some((b) => b.name.toLowerCase() === name.toLowerCase())) throw new UserError("There's already an office with that name");
     if (others.some((b) => b.code === code)) throw new UserError("Another office already uses that code");
+    if (managerId && !(await c.query(`select 1 from employees where employee_id = $1 and record_status <> 'SEPARATED'`, [managerId])).rowCount) throw new UserError("Choose a current employee as manager");
     if (existing) {
-      await c.query(`update org_units set code = $2, address = $3 where id = $1`, [existing.id, code, address]);
-      const changed = [existing.code !== code && `Code: ${existing.code} → ${code}`, existing.address !== address && "Address changed"].filter(Boolean).join("; ");
+      await c.query(`update org_units set code = $2, address = $3, contact_name = $4, contact_phone = $5, head_employee_id = $6 where id = $1`, [existing.id, code, address, contactName, contactPhone, managerId]);
+      const changed = [
+        existing.code !== code && `Code: ${existing.code} → ${code}`,
+        existing.address !== address && "Address changed",
+        (existing.contact_name !== contactName || existing.contact_phone !== contactPhone) && "Contact changed",
+        (existing.head_employee_id ?? null) !== managerId && `Manager → ${managerId ?? "none"}`,
+      ].filter(Boolean).join("; ");
       if (changed) await log(c, s, "Changed office", name, changed);
       return { id: existing.id as string };
     }
     const company = (await c.query(`select id from org_units where unit_type = 'company' limit 1`)).rows[0];
-    const { rows: [r] } = await c.query(`insert into org_units (unit_type, name, code, parent_id, address) values ('branch', $1, $2, $3, $4) returning id`, [name, code, company?.id ?? null, address]);
+    const { rows: [r] } = await c.query(
+      `insert into org_units (unit_type, name, code, parent_id, address, contact_name, contact_phone, head_employee_id) values ('branch', $1, $2, $3, $4, $5, $6, $7) returning id`,
+      [name, code, company?.id ?? null, address, contactName, contactPhone, managerId],
+    );
     await log(c, s, "Added office", name, `Code ${code}`);
     return { id: r.id as string };
   });

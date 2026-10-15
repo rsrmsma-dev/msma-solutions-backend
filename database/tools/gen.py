@@ -79,7 +79,7 @@ for d in DOMAINS:
             body.append(s)
             if c["fk"]:
                 tgt, tcol = c["fk"]
-                if (name in ("remote_work_day_branches", "holiday_rule_branches", "approval_workflow_steps", "payroll_run_lines") and c["pk"] and tgt != "employees") or name in ("user_sessions", "mfa_backup_codes", "user_preferences") or (name, c["name"]) == ("holiday_changes", "holiday_rule_id"):
+                if (name in ("remote_work_day_branches", "holiday_rule_branches", "approval_workflow_steps", "payroll_run_lines") and c["pk"] and tgt != "employees") or name in ("user_sessions", "mfa_backup_codes", "user_preferences") or (name, c["name"]) in (("holiday_changes", "holiday_rule_id"), ("notifications", "account_id")):
                     ondel = "CASCADE"  # rows that only exist as part of their parent
                 elif not (c["nn"] or c["pk"]):
                     ondel = "SET NULL"
@@ -115,6 +115,9 @@ lines += ["-- Extra integrity rules",
 "ALTER TABLE contribution_rate_versions ADD UNIQUE (agency, effective_from);",
 "ALTER TABLE subscriptions ADD CHECK (seat_limit IS NULL OR seat_limit > 0);",
 "ALTER TABLE subscriptions ADD CHECK (price_per_seat IS NULL OR price_per_seat >= 0);",
+"ALTER TABLE subscriptions ADD CHECK (seat_limit_override IS NULL OR seat_limit_override > 0);",
+"ALTER TABLE subscriptions ADD CHECK ((extension_seats IS NULL) = (extension_until IS NULL) AND (extension_seats IS NULL OR extension_seats > 0));",
+"ALTER TABLE subscription_plans ADD CHECK (employee_seat_limit > 0 AND admin_account_limit >= 0 AND grace_percent BETWEEN 0 AND 100);",
 "ALTER TABLE loans ADD CHECK (principal > 0 AND installment > 0 AND installment <= principal);",
 "ALTER TABLE final_pay_cases ADD CHECK (released_at IS NULL OR (release_items IS NOT NULL AND release_total IS NOT NULL));",
 "ALTER TABLE reimbursement_claims ADD CHECK ((paid_at IS NULL) = (payout_method IS NULL));",
@@ -125,6 +128,10 @@ lines += ["-- Extra integrity rules",
 "ALTER TABLE holiday_changes ADD UNIQUE (builtin_rule_id, year);",
 "ALTER TABLE holiday_changes ADD UNIQUE (holiday_rule_id, year);",
 "ALTER TABLE company_policies ADD CHECK (version >= 1);",
+"ALTER TABLE company_settings ADD CONSTRAINT company_settings_paydays CHECK (payday_first BETWEEN 1 AND 31 AND payday_second BETWEEN 1 AND 31 AND payday_second - payday_first >= 7);",
+"ALTER TABLE employee_pay_profiles ADD CONSTRAINT employee_pay_profiles_amounts CHECK (transport_allowance >= 0 AND ot_meal_rate >= 0 AND de_minimis >= 0 AND other_non_taxable >= 0);",
+"ALTER TABLE employee_pay_profiles ADD CONSTRAINT employee_pay_profiles_client_share CHECK (client_share >= 0 AND client_share <= 100);",
+"ALTER TABLE time_requests ADD CONSTRAINT time_requests_times CHECK ((start_at IS NULL AND end_at IS NULL) OR (start_at IS NOT NULL AND end_at > start_at));",
 "CREATE UNIQUE INDEX company_policies_title_ci ON company_policies (lower(title)) WHERE status <> 'archived';",
 "",
 "-- New Employees Template rules (BRD v1.1, 11.2.1)",
@@ -152,6 +159,7 @@ lines += ["-- Extra integrity rules",
 "CREATE INDEX ON leave_requests (employee_id, date_from, date_to);",
 "CREATE INDEX ON audit_log (employee_id, occurred_at DESC);",
 "CREATE INDEX ON employee_documents (expires_on) WHERE expires_on IS NOT NULL;",
+"CREATE INDEX ON notifications (account_id, created_at DESC);",
 "",
 "INSERT INTO schema_migrations (version) VALUES " + ", ".join(f"('{os.path.splitext(f)[0]}')" for f in sorted(os.listdir(os.path.join(OUT, "migrations")))) + ";" if os.path.isdir(os.path.join(OUT, "migrations")) and os.listdir(os.path.join(OUT, "migrations")) else "",
 "COMMIT;", ""]
